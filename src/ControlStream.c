@@ -1833,8 +1833,18 @@ int startControlStream(void) {
         // The 3DS can take a bit longer to set up when starting fresh
         enet_peer_timeout(peer, 2, 60000, 60000);
 #else
-        // Set the peer timeout to 10 seconds and limit backoff to 2x RTT
-        enet_peer_timeout(peer, 2, 10000, 10000);
+        // Set the peer timeout to 20 seconds and limit backoff to 2x RTT.
+        // Upstream default here was 10 seconds, tuned for a direct LAN/WAN
+        // path. USBridge routes the control channel through a local tsnet
+        // proxy (see startMoonlightProxy / the agent's StreamProxy) whenever
+        // the peer isn't reachable on the LAN, adding a WireGuard hop that
+        // sometimes falls back to a DERP relay — real, occasionally bursty
+        // extra latency that the 10s bound was tripping on, producing a
+        // spurious "Control stream received unexpected disconnect event"
+        // and a full reconnect even though the underlying link was fine
+        // moments later. 20s still catches a genuinely dead peer promptly;
+        // it just stops flagging relay jitter as a disconnect.
+        enet_peer_timeout(peer, 2, 20000, 20000);
 #endif
     }
     else {
