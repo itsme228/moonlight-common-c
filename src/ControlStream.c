@@ -119,6 +119,9 @@ static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
 static LINKED_BLOCKING_QUEUE asyncCallbackQueue;
 static PLT_EVENT idrFrameRequiredEvent;
 
+// requestIdrFrameFunc's own throttle -- see its doc comment.
+static uint64_t lastIdrFrameRequestSentMs;
+
 static PPLT_CRYPTO_CONTEXT encryptionCtx;
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
 
@@ -1621,6 +1624,26 @@ static void referenceFrameControlFunc(void* context) {
     }
 }
 
+// Minimum spacing between actual on-wire IDR frame requests. Distinct
+// decode-loss events (different frames each independently detected as
+// missing/corrupt, e.g. in VideoDepacketizer.c) can each call
+// LiRequestIdrFrame() within a short, genuinely bad-network window --
+// idrFrameRequiredEvent itself already coalesces any of those that land
+// while a request is in flight (it's a flag, not a queue), but once this
+// loop finishes one round trip and goes back to waiting, a *new* loss event
+// that arrived in the meantime wakes it immediately for another real
+// send. Confirmed live: 8 separate on-wire requests within ~1.2s of bad
+// network. Harmless on its own (a tiny reliable control message each), but
+// pointless beyond the host's own cooldown -- gamestream-server (and
+// Sunshine) both only ever honor one IDR per MIN_REQUESTED_IDR_INTERVAL
+// (1.5s) regardless of how many requests arrive, so anything sent faster
+// than that is coalesced host-side into the one keyframe that answers all
+// of them anyway. Matching that interval here means this thread's own
+// PltWaitForEvent/requestIdrFrame round trip is the only one that still
+// does real work; the rest just extend how recently a request was sent
+// without needing a network round trip of their own.
+#define MIN_IDR_FRAME_REQUEST_INTERVAL_MS 1500
+
 static void requestIdrFrameFunc(void* context) {
     while (!PltIsThreadInterrupted(&requestIdrFrameThread)) {
         PltWaitForEvent(&idrFrameRequiredEvent);
@@ -1631,11 +1654,26 @@ static void requestIdrFrameFunc(void* context) {
             return;
         }
 
+        // Throttle to MIN_IDR_FRAME_REQUEST_INTERVAL_MS since the last
+        // actual send -- see this constant's own doc comment. Sleeping
+        // here (rather than dropping the request) still lets it coalesce
+        // with any further loss events that arrive during the wait, same
+        // as the event flag already does for events that land mid-round-trip.
+        uint64_t now = PltGetMillis();
+        uint64_t sinceLastRequest = now - lastIdrFrameRequestSentMs;
+        if (lastIdrFrameRequestSentMs != 0 && sinceLastRequest < MIN_IDR_FRAME_REQUEST_INTERVAL_MS) {
+            PltSleepMsInterruptible(&requestIdrFrameThread, (int)(MIN_IDR_FRAME_REQUEST_INTERVAL_MS - sinceLastRequest));
+            if (stopping || PltIsThreadInterrupted(&requestIdrFrameThread)) {
+                return;
+            }
+        }
+
         // Any pending RFI requests and LTR frame ACK messages are now redundant
         freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
 
         // Request the IDR frame
         requestIdrFrame();
+        lastIdrFrameRequestSentMs = PltGetMillis();
     }
 }
 

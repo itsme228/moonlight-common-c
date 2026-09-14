@@ -228,6 +228,18 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
     } while (err < 0 && LastSocketError() == ECONNREFUSED);
 #endif
 
+    // Unlike BSD sockets (which silently truncate an oversized datagram to fit the
+    // caller's buffer and return the truncated length with no error), Winsock fails
+    // the call with WSAEMSGSIZE while still filling the buffer with the first 'size'
+    // bytes of the datagram and discarding the rest. Without this, a single host
+    // audio/video packet larger than our receive buffer would look like a fatal
+    // socket error on Windows and tear down the whole connection, whereas the same
+    // packet is silently (and harmlessly, from the socket layer's perspective)
+    // truncated on other platforms. Match that behavior here instead of failing.
+    if (err < 0 && LastSocketError() == EMSGSIZE) {
+        return size;
+    }
+
     return err;
 }
 
