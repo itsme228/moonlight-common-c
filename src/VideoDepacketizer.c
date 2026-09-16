@@ -25,6 +25,210 @@ static uint32_t firstPacketRtpTimestamp;
 static bool dropStatePending;
 static bool idrFrameProcessed;
 
+// ─── Adaptive playout jitter buffer ────────────────────────────────────────
+// Client-side only: absorbs transient network jitter (WiFi packet delay
+// variance) between frame arrivals without adding latency on a clean link.
+// NVIDIA's original GameStream protocol has no equivalent here -- it relies
+// solely on per-frame Reed-Solomon FEC (RtpVideoQueue.c) to recover from
+// packet loss/reorder *within* one frame's own arrival window, then submits
+// every completed frame to the decoder the instant it's assembled, with no
+// deliberate delay at all. That's fine on the clean, near-zero-jitter wired
+// LAN it was designed for, but it means the decoder simply starves whenever
+// a frame's packets arrive late as a burst on a real WiFi link -- exactly
+// the "Moonlight Decoder/Network stalled" events seen in benchmarking.
+//
+// This estimates jitter using the RFC 3550 transit-time technique, but on
+// the RTP packet header's own 90kHz timestamp rather than the higher-level
+// presentationTimeUs field, because some hosts (see the `syntheticPtsBaseUs`
+// fallback above) synthesize that field from local receive time when they
+// don't send a real PTS extension, which would otherwise make the delta
+// always ~0 and hide real jitter. The RTP header timestamp itself is a
+// mandatory wire-format field for both Sunshine and this project's own
+// streamer (and any other GFE-compatible host), so this works identically
+// for either backend and needs no protocol changes at all -- pure local
+// receive-side timing.
+//
+// Frames are released according to a fixed local schedule anchored to one
+// reference frame: schedule(frame) = anchorLocalUs + (frame.rtp - anchorRtp)
+// converted to microseconds. On a steady link this adds a constant latency
+// (the buffer depth) without changing the *gap* between releases -- the
+// constant offset cancels out between consecutive on-schedule frames -- so
+// it smooths out arrival jitter without inflating the stall metric.
+//
+// If a frame's slot has already passed by the time we dequeue it, it's
+// released immediately -- but the schedule is only *re-anchored* (given up
+// on and restarted from here) when the lateness is large (> a few buffer
+// depths' worth, see PLAYOUT_RESYNC_THRESHOLD_US), meaning a real stall or
+// pause happened, not just jitter. A single late frame does NOT move the
+// anchor: the next frame is still scheduled against the same reference, so
+// the buffer's margin naturally refills as soon as arrivals catch back up.
+//
+// Design notes from earlier iterations that didn't work, kept here because
+// the failure modes are non-obvious and easy to reintroduce by accident:
+//   v1: gated the delay on "is the queue currently empty". Wrong -- an
+//       empty queue is the *normal* steady-state (the decoder consumes
+//       frames about as fast as they arrive), so that added the delay to
+//       nearly every frame's own submit gap, directly inflating the stall
+//       metric it was meant to reduce (93 vs. 79 stalls/90s on a live
+//       WiFi retest).
+//   v2: anchored schedule as described above, but re-anchored on *every*
+//       single late frame, not just large/sustained lateness. That's
+//       exactly backwards: frequent small lateness is precisely what
+//       happens when the network is jittery -- i.e. exactly when the
+//       buffer is needed -- and resyncing on every one of those misses
+//       collapses the schedule back to "release immediately" right when
+//       smoothing matters most, making it a no-op under load (measured no
+//       better than baseline, and worse in one run).
+//
+// Only applies to the pull/queued decode path (LiWaitForNextVideoFrame,
+// used when CAPABILITY_DIRECT_SUBMIT is not set -- macOS/Linux/iOS today).
+// Windows/Android submit synchronously from the RTP receive thread itself;
+// sleeping there would delay receipt of later packets, which needs a real
+// separate playout thread to do safely, not a small tweak to this queue.
+#define PLAYOUT_JITTER_SHIFT_GROW    2      // fast growth on a real jitter spike (~1/4 weight)
+#define PLAYOUT_JITTER_SHIFT_DECAY   6      // slow decay back down (~1/64 weight) once it's calm again
+#define PLAYOUT_DELAY_MULTIPLIER     3      // target delay = jitter estimate * this
+#define PLAYOUT_DELAY_MAX_US         100000 // hard cap -- never add more than 100ms. Raised from an initial
+                                             // 50ms after live WiFi debugging showed sustained jitter of
+                                             // 12-54ms on a real bad link: a 50ms cap was saturating almost
+                                             // immediately (jitter*3 already exceeds it above ~17ms of
+                                             // jitter), leaving no real margin to absorb it.
+#define PLAYOUT_RESYNC_THRESHOLD_US  150000 // give up on the schedule only past this much lateness
+#define PLAYOUT_STATUS_LOG_FRAMES    120    // ~every 2s at 60fps -- tuning visibility, not spam
+#define PLAYOUT_DELAY_MAX_STEP_US    1500   // v4 bug: the raw jitter estimate can jump by tens of ms in
+                                             // one step (that's the point of its fast-growth EWMA), and
+                                             // v4 fed that directly into the per-frame schedule -- so the
+                                             // *delay itself* changing between two consecutive frames
+                                             // perturbed their release gap by that same amount, recreating
+                                             // the stall pattern the buffer exists to remove (confirmed:
+                                             // 155 stalls even after jitter calmed to 2-8ms late in a
+                                             // test run). This caps how fast the *applied* delay can move
+                                             // per frame, decoupled from how fast the estimate itself
+                                             // reacts -- ~1.5ms/frame reaches the 100ms cap in ~1s, which
+                                             // is fast enough to adapt without perturbing steady-state gaps.
+#define RTP_CLOCK_RATE_HZ            90000  // fixed by the Moonlight/GameStream RTP profile
+static bool havePrevFrameTiming;
+static uint64_t prevFrameReceiveTimeUs;
+static uint32_t prevFrameRtpTimestamp;
+static int64_t networkJitterUs;
+static uint64_t appliedPlayoutDelayUs;
+static unsigned int playoutStatusLogCounter;
+
+static bool havePlayoutAnchor;
+static uint64_t playoutAnchorLocalUs;
+static uint32_t playoutAnchorRtpTimestamp;
+
+// Converts a duration expressed in 90kHz RTP clock ticks to microseconds.
+static uint64_t rtpTicksToUs(uint32_t deltaTicks) {
+    return ((uint64_t)deltaTicks * 1000ULL) / (RTP_CLOCK_RATE_HZ / 1000);
+}
+
+// Returns the raw, instantaneous playout delay target derived from the
+// current jitter estimate -- NOT what should be fed directly into the
+// per-frame schedule (see advancePlayoutDelayUs()).
+static uint64_t targetPlayoutDelayUs(void) {
+    int64_t delay = networkJitterUs * PLAYOUT_DELAY_MULTIPLIER;
+    if (delay < 0) {
+        delay = 0;
+    }
+    else if (delay > PLAYOUT_DELAY_MAX_US) {
+        delay = PLAYOUT_DELAY_MAX_US;
+    }
+    return (uint64_t)delay;
+}
+
+// Moves the actually-applied delay one step closer to targetPlayoutDelayUs(),
+// by at most PLAYOUT_DELAY_MAX_STEP_US, and returns the new applied value.
+// Must be called exactly once per frame (from playoutDelayForFrame) --
+// calling it more or less often changes the effective ramp rate.
+static uint64_t advancePlayoutDelayUs(void) {
+    uint64_t target = targetPlayoutDelayUs();
+    if (target > appliedPlayoutDelayUs) {
+        uint64_t step = target - appliedPlayoutDelayUs;
+        appliedPlayoutDelayUs += (step > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : step;
+    }
+    else if (target < appliedPlayoutDelayUs) {
+        uint64_t step = appliedPlayoutDelayUs - target;
+        appliedPlayoutDelayUs -= (step > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : step;
+    }
+    return appliedPlayoutDelayUs;
+}
+
+// Updates the jitter estimate using this newly-completed frame's RTP
+// timestamp and local receive time versus the previous frame's.
+static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTimestamp) {
+    if (havePrevFrameTiming) {
+        int64_t rtpDeltaUs = (int64_t)rtpTicksToUs((uint32_t)(rtpTimestamp - prevFrameRtpTimestamp));
+        int64_t receiveDeltaUs = (int64_t)(receiveTimeUs - prevFrameReceiveTimeUs);
+        int64_t transitDeltaUs = receiveDeltaUs - rtpDeltaUs;
+        if (transitDeltaUs < 0) {
+            transitDeltaUs = -transitDeltaUs;
+        }
+
+        int shift = (transitDeltaUs > networkJitterUs) ? PLAYOUT_JITTER_SHIFT_GROW : PLAYOUT_JITTER_SHIFT_DECAY;
+        networkJitterUs += (transitDeltaUs - networkJitterUs) >> shift;
+    }
+
+    prevFrameReceiveTimeUs = receiveTimeUs;
+    prevFrameRtpTimestamp = rtpTimestamp;
+    havePrevFrameTiming = true;
+
+    if (++playoutStatusLogCounter >= PLAYOUT_STATUS_LOG_FRAMES) {
+        playoutStatusLogCounter = 0;
+        Limelog("PlayoutBuffer: jitter=%lldus target=%lluus applied=%lluus\n",
+                (long long)networkJitterUs, (unsigned long long)targetPlayoutDelayUs(),
+                (unsigned long long)appliedPlayoutDelayUs);
+    }
+}
+
+// Returns how long (in microseconds, possibly 0) the caller should wait
+// before releasing this already-dequeued frame to the decoder, and advances
+// the playout schedule. See the design comment above for the anchoring and
+// re-sync-on-miss behavior.
+//
+// v3 bug (found via the debug logging below): the anchor's offset from raw
+// arrival time was baked in once, from currentPlayoutDelayUs() as read at
+// the very first frame -- when the jitter estimate is still 0, since there's
+// no history yet. Because resyncs are rare by design (see above), that
+// zero offset then never got refreshed for the rest of the session: the
+// buffer was measuring jitter correctly (confirmed in the logs) but never
+// actually acting on it, a pure no-op indistinguishable from no buffer at
+// all. Fixed in v4 by keeping the anchor itself purely about raw arrival
+// timing (no offset) and adding the *current* delay on top fresh for every
+// frame, so the buffer depth actually tracks live jitter instead of a
+// stale reading from connection start.
+static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimestamp) {
+    uint64_t now = PltGetMicroseconds();
+
+    if (!havePlayoutAnchor) {
+        playoutAnchorRtpTimestamp = rtpTimestamp;
+        playoutAnchorLocalUs = receiveTimeUs;
+        havePlayoutAnchor = true;
+    }
+
+    uint64_t rawScheduleUs = playoutAnchorLocalUs + rtpTicksToUs((uint32_t)(rtpTimestamp - playoutAnchorRtpTimestamp));
+    uint64_t idealReleaseUs = rawScheduleUs + advancePlayoutDelayUs();
+
+    if (now < idealReleaseUs) {
+        return idealReleaseUs - now;
+    }
+
+    // This frame's slot already passed. A small miss is normal jitter --
+    // release immediately but leave the anchor alone, so the schedule (and
+    // its buffering margin) survives for the next frame. Only give up and
+    // re-anchor here if the miss is large enough to mean a real stall or
+    // pause, not just jitter -- otherwise every jittery period would keep
+    // resetting the schedule right when it's needed most (see the v2
+    // design note above).
+    uint64_t lateByUs = now - idealReleaseUs;
+    if (lateByUs > PLAYOUT_RESYNC_THRESHOLD_US) {
+        Limelog("PlayoutBuffer: resync after %llums of drift\n", (unsigned long long)(lateByUs / 1000));
+        playoutAnchorRtpTimestamp = rtpTimestamp;
+        playoutAnchorLocalUs = receiveTimeUs;
+    }
+    return 0;
+}
+
 #define DR_CLEANUP -1000
 
 #define CONSECUTIVE_DROP_LIMIT 120
@@ -78,6 +282,17 @@ void initializeVideoDepacketizer(int pktSize) {
     dropStatePending = false;
     idrFrameProcessed = false;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
+
+    havePrevFrameTiming = false;
+    prevFrameReceiveTimeUs = 0;
+    prevFrameRtpTimestamp = 0;
+    networkJitterUs = 0;
+    appliedPlayoutDelayUs = 0;
+    playoutStatusLogCounter = 0;
+
+    havePlayoutAnchor = false;
+    playoutAnchorLocalUs = 0;
+    playoutAnchorRtpTimestamp = 0;
 }
 
 // Free the NAL chain
@@ -240,6 +455,12 @@ bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* deco
     int err = LbqWaitForQueueElement(&decodeUnitQueue, (void**)&qdu);
     if (err != LBQ_SUCCESS) {
         return false;
+    }
+
+    // Adaptive playout delay -- see the design comment above playoutDelayForFrame().
+    uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+    if (delayUs > 0) {
+        PltSleepMs((int)(delayUs / 1000));
     }
 
     validateDecodeUnitForPlayback(&qdu->decodeUnit);
@@ -490,6 +711,8 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             qdu->decodeUnit.presentationTimeUs = firstPacketPresentationTime;
             qdu->decodeUnit.rtpTimestamp = firstPacketRtpTimestamp;
             qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
+
+            updatePlayoutJitterEstimate(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
 
             // These might be wrong for a few frames during a transition between SDR and HDR,
             // but the effects shouldn't very noticable since that's an infrequent operation.
