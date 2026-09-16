@@ -458,9 +458,26 @@ bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* deco
     }
 
     // Adaptive playout delay -- see the design comment above playoutDelayForFrame().
-    uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
-    if (delayUs > 0) {
-        PltSleepMs((int)(delayUs / 1000));
+    // Skipped entirely whenever another frame is already queued up behind this
+    // one: a non-empty queue means the decoder has fallen behind arrivals (e.g.
+    // a network stall just cleared and several frames arrived in a burst), and
+    // continuing to pace individual frames at cadence in that state starves
+    // this same queue from the *enqueue* side -- the RTP receive thread keeps
+    // depositing new frames while this thread sleeps -- which can overflow the
+    // queue's bound and force a hard IDR-recovery reset.
+    //
+    // Confirmed live: shipping without this check caused a genuine playback
+    // outage (stuck at ~0.6fps, an endless "Video decode unit queue overflow"
+    // -> IDR-request -> overflow-again loop, since even the recovery IDR frame
+    // got the same treatment). Draining backlog immediately here is always
+    // safe: it's exactly what would happen anyway with no buffer at all, so
+    // this can never be worse than the pre-buffer baseline -- the buffer only
+    // ever adds delay once the decoder has genuinely caught back up.
+    if (LbqGetItemCount(&decodeUnitQueue) == 0) {
+        uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+        if (delayUs > 0) {
+            PltSleepMs((int)(delayUs / 1000));
+        }
     }
 
     validateDecodeUnitForPlayback(&qdu->decodeUnit);
