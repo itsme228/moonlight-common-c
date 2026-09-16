@@ -124,6 +124,16 @@ static void VideoReceiveThreadProc(void* context) {
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
+        // Stage timing: this is the only thread that drains the video UDP
+        // socket, and with CAPABILITY_DIRECT_SUBMIT, RtpvAddPacket() below can
+        // synchronously trigger full frame decode (see VideoDepacketizer.c's
+        // reassembleFrame -> submitDecodeUnit chain) before this loop gets back
+        // to recvUdpSocket(). Anything slow here delays draining the socket
+        // exactly like a slow decode does -- this reports where between "packet
+        // handed to the FEC queue" and "queue call returns" the time actually
+        // went, instead of leaving that whole span as an unexplained gap
+        // between platform-side decode timing logs.
+        uint64_t tRecvEnd = 0, tDecryptEnd = 0;
 
         if (buffer == NULL) {
             buffer = (char*)malloc(bufferSize);
@@ -138,6 +148,7 @@ static void VideoReceiveThreadProc(void* context) {
                             encrypted ? encryptedBuffer : buffer,
                             receiveSize,
                             useSelect);
+        tRecvEnd = PltGetMicroseconds();
         if (err < 0) {
             Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -220,6 +231,7 @@ static void VideoReceiveThreadProc(void* context) {
                 continue;
             }
         }
+        tDecryptEnd = PltGetMicroseconds();
 
         // Convert fields to host byte-order
         packet = (PRTP_PACKET)&buffer[0];
@@ -228,6 +240,24 @@ static void VideoReceiveThreadProc(void* context) {
         packet->ssrc = BE32(packet->ssrc);
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+
+        {
+            uint64_t tAddPacketEnd = PltGetMicroseconds();
+            uint64_t processingUs = tAddPacketEnd - tRecvEnd;
+            // >5ms of non-network-wait processing for one packet is already
+            // more than half a frame's budget at 120fps -- almost always means
+            // RtpvAddPacket() just completed a frame and synchronously ran it
+            // through decode (DIRECT_SUBMIT), not FEC bookkeeping for a single
+            // shard, which is normally sub-millisecond. Bucket boundary lets
+            // this be told apart at a glance from the decrypt/decode timing
+            // logs elsewhere without needing to correlate timestamps by hand.
+            if (processingUs > 5000) {
+                Limelog("SLOW video receive-loop iteration: %lluus not draining socket (decrypt=%lluus addPacket=%lluus)\n",
+                        (unsigned long long)processingUs,
+                        (unsigned long long)(tDecryptEnd - tRecvEnd),
+                        (unsigned long long)(tAddPacketEnd - tDecryptEnd));
+            }
+        }
 
         if (queueStatus == RTPF_RET_QUEUED) {
             // The queue owns the buffer

@@ -398,7 +398,13 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
             }
         }
 
-#if defined(LC_DEBUG)
+        // Always logged (not just LC_DEBUG builds): the OS can silently grant far
+        // less than requested, and a too-small receive buffer looks identical to
+        // real network packet loss in the RFI/FEC logs above -- a burst of
+        // packets arrives faster than this thread drains the socket, the kernel
+        // buffer fills, and everything after that point is dropped before this
+        // code ever sees it. Cheap (one line per connection) and the only way to
+        // tell "buffer too small" apart from "actually lost on the wire".
         if (err == 0) {
             Limelog("Selected receive buffer size: %d\n", bufferSize);
         }
@@ -412,7 +418,6 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
                 Limelog("Actual receive buffer size: %d\n", bufferSize);
             }
         }
-#endif
     }
 
     return s;

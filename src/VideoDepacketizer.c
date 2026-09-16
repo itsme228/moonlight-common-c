@@ -192,15 +192,31 @@ static uint64_t advancePlayoutDelayUs(void) {
 // timestamp and local receive time versus the previous frame's.
 static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTimestamp) {
     if (havePrevFrameTiming) {
-        int64_t rtpDeltaUs = (int64_t)rtpTicksToUs((uint32_t)(rtpTimestamp - prevFrameRtpTimestamp));
-        int64_t receiveDeltaUs = (int64_t)(receiveTimeUs - prevFrameReceiveTimeUs);
-        int64_t transitDeltaUs = receiveDeltaUs - rtpDeltaUs;
-        if (transitDeltaUs < 0) {
-            transitDeltaUs = -transitDeltaUs;
-        }
+        // Signed 32-bit subtraction correctly handles the 90kHz RTP clock's own
+        // wraparound (~13.25h) via modular arithmetic. A non-positive result means
+        // this frame's RTP timestamp did not advance versus the last one we
+        // measured -- observed after RFI/IDR recovery reorders which frame's
+        // timing this function sees next -- and isn't a valid transit-time
+        // sample. Previously the delta was cast straight to uint32_t, so a
+        // negative delta wrapped to ~4 billion ticks and briefly sent
+        // networkJitterUs into the billions of "microseconds" (seen live as
+        // e.g. "jitter=17123437318us" in PlayoutBuffer's own status log).
+        // Harmless today only because targetPlayoutDelayUs() hard-clamps to
+        // PLAYOUT_DELAY_MAX_US, but it made the jitter metric meaningless for
+        // diagnosing real network conditions during exactly the periods that
+        // matter most.
+        int32_t rtpDeltaTicks = (int32_t)(rtpTimestamp - prevFrameRtpTimestamp);
+        if (rtpDeltaTicks > 0) {
+            int64_t rtpDeltaUs = (int64_t)rtpTicksToUs((uint32_t)rtpDeltaTicks);
+            int64_t receiveDeltaUs = (int64_t)(receiveTimeUs - prevFrameReceiveTimeUs);
+            int64_t transitDeltaUs = receiveDeltaUs - rtpDeltaUs;
+            if (transitDeltaUs < 0) {
+                transitDeltaUs = -transitDeltaUs;
+            }
 
-        int shift = (transitDeltaUs > networkJitterUs) ? PLAYOUT_JITTER_SHIFT_GROW : PLAYOUT_JITTER_SHIFT_DECAY;
-        networkJitterUs += (transitDeltaUs - networkJitterUs) >> shift;
+            int shift = (transitDeltaUs > networkJitterUs) ? PLAYOUT_JITTER_SHIFT_GROW : PLAYOUT_JITTER_SHIFT_DECAY;
+            networkJitterUs += (transitDeltaUs - networkJitterUs) >> shift;
+        }
     }
 
     prevFrameReceiveTimeUs = receiveTimeUs;
@@ -249,7 +265,29 @@ static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimesta
         return 0;
     }
 
-    uint64_t rawScheduleUs = playoutAnchorLocalUs + rtpTicksToUs((uint32_t)(rtpTimestamp - playoutAnchorRtpTimestamp));
+    // Signed 32-bit subtraction correctly handles the RTP clock's own
+    // wraparound; a non-positive result means this frame's RTP timestamp is
+    // at or behind the anchor's -- observed after RFI/IDR recovery reorders
+    // which frame this function sees next -- so the anchor is stale. Re-anchor
+    // immediately instead of feeding it through rtpTicksToUs(): the previous
+    // unsigned cast turned a negative delta into ~4 billion ticks (~47721s)
+    // and idealReleaseUs landed that far in the future, so `now < idealReleaseUs`
+    // below was true and this returned that many *microseconds* as the delay
+    // before releasing the frame -- a real PltSleepMs() call on the thread that
+    // also drains the video socket, i.e. video freezing for hours, not the
+    // brief stall this buffer is meant to add. This can't self-heal via the
+    // lateByUs resync check further down because that check only runs when
+    // idealReleaseUs has already passed, which a schedule tens of thousands of
+    // seconds in the future never does.
+    int32_t rtpDeltaTicks = (int32_t)(rtpTimestamp - playoutAnchorRtpTimestamp);
+    if (rtpDeltaTicks < 0) {
+        playoutAnchorRtpTimestamp = rtpTimestamp;
+        playoutAnchorLocalUs = receiveTimeUs;
+        lastResyncLocalUs = now;
+        return 0;
+    }
+
+    uint64_t rawScheduleUs = playoutAnchorLocalUs + rtpTicksToUs((uint32_t)rtpDeltaTicks);
     uint64_t idealReleaseUs = rawScheduleUs + advancePlayoutDelayUs();
 
     if (now < idealReleaseUs) {
@@ -825,14 +863,37 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 // draining the video socket, not just presentation -- see
                 // that same comment for why PLAYOUT_DELAY_MAX_US and
                 // PLAYOUT_POST_RESYNC_GRACE_US are sized the way they are.
+                uint64_t tPlayout0 = PltGetMicroseconds();
                 uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+                uint64_t tPlayout1 = PltGetMicroseconds();
                 if (delayUs > 0) {
                     PltSleepMs((int)(delayUs / 1000));
                 }
+                uint64_t tSleepEnd = PltGetMicroseconds();
 
                 // Submit the frame to the decoder
                 validateDecodeUnitForPlayback(&qdu->decodeUnit);
+                uint64_t tSubmitStart = PltGetMicroseconds();
                 LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
+                uint64_t tSubmitEnd = PltGetMicroseconds();
+
+                // Brackets exactly where VideoStream.c's "SLOW video receive-loop
+                // iteration" time (addPacket, when it completes a frame) actually
+                // goes: computing the schedule, the sleep that computation asked
+                // for, or the platform submitDecodeUnit callback itself (decode +
+                // readback + render submit on Windows). Without this split, a
+                // multi-second addPacket() reading could be any of the three --
+                // this pins it down instead of requiring cross-referencing
+                // separate log lines from separate threads/files by timestamp.
+                if (tSubmitEnd - tPlayout0 > 5000) {
+                    Limelog("PlayoutBuffer: SLOW direct-submit frame %u: %lluus total (playoutCalc=%lluus sleep=%lluus[requested=%lluus] submitDecodeUnit=%lluus)\n",
+                            frameNumber,
+                            (unsigned long long)(tSubmitEnd - tPlayout0),
+                            (unsigned long long)(tPlayout1 - tPlayout0),
+                            (unsigned long long)(tSleepEnd - tPlayout1),
+                            (unsigned long long)delayUs,
+                            (unsigned long long)(tSubmitEnd - tSubmitStart));
+                }
             }
 
             // Notify the control connection
