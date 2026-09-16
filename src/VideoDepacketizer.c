@@ -80,20 +80,54 @@ static bool idrFrameProcessed;
 //       smoothing matters most, making it a no-op under load (measured no
 //       better than baseline, and worse in one run).
 //
-// Only applies to the pull/queued decode path (LiWaitForNextVideoFrame,
-// used when CAPABILITY_DIRECT_SUBMIT is not set -- macOS/Linux/iOS today).
-// Windows/Android submit synchronously from the RTP receive thread itself;
-// sleeping there would delay receipt of later packets, which needs a real
-// separate playout thread to do safely, not a small tweak to this queue.
+// v7: this now also applies on the CAPABILITY_DIRECT_SUBMIT path (see the
+// call site in reassembleFrame() below), not just the pull/queued decode
+// thread. Two earlier full architectures were tried and abandoned first:
+//   - Removing CAPABILITY_DIRECT_SUBMIT to activate moonlight-common-c's
+//     own queue+decoder-thread machinery (LiWaitForNextVideoFrame) worked
+//     for the buffer itself (confirmed: applied delay tracked jitter
+//     correctly, stalls dropped sharply), but running decode/render on a
+//     separate thread from the network receive thread caused a *worse*,
+//     unrelated regression on this project's macOS Metal/CVDisplayLink
+//     path: real render throughput to the screen collapsed to ~10-15fps
+//     while decode itself kept running at the full ~60fps (confirmed live:
+//     CVDisplayLink's own fire rate halved from ~60Hz to ~30Hz with the
+//     extra thread running, reproduced twice back-to-back by toggling the
+//     capability bit with nothing else changed). Not something this file
+//     can fix -- it's downstream Metal/AppKit thread-scheduling behavior.
+//
+// Applying the delay directly on the DIRECT_SUBMIT path avoids that
+// regression entirely (same one thread as before, no new thread), but
+// changes the risk profile: this thread is also the one reading the video
+// UDP socket, so sleeping here delays draining it, not just delaying
+// presentation. The video socket's receive buffer is sized generously
+// (RTP_RECV_PACKETS_BUFFERED = 2048 packets, VideoStream.c) -- around 2MB,
+// which even at a high 80 Mbps stream bitrate absorbs on the order of 200ms
+// of buffered traffic -- so a bounded sleep here has real margin before
+// risking a kernel-buffer overflow, but PLAYOUT_DELAY_MAX_US below is kept
+// well under that margin rather than pushed to it. See
+// PLAYOUT_POST_RESYNC_GRACE_US for the other DIRECT_SUBMIT-specific risk
+// (a backlog of already-arrived frames draining right after a stall) and
+// why it matters more here than on the queued path.
 #define PLAYOUT_JITTER_SHIFT_GROW    2      // fast growth on a real jitter spike (~1/4 weight)
 #define PLAYOUT_JITTER_SHIFT_DECAY   6      // slow decay back down (~1/64 weight) once it's calm again
 #define PLAYOUT_DELAY_MULTIPLIER     3      // target delay = jitter estimate * this
-#define PLAYOUT_DELAY_MAX_US         100000 // hard cap -- never add more than 100ms. Raised from an initial
-                                             // 50ms after live WiFi debugging showed sustained jitter of
-                                             // 12-54ms on a real bad link: a 50ms cap was saturating almost
-                                             // immediately (jitter*3 already exceeds it above ~17ms of
-                                             // jitter), leaving no real margin to absorb it.
+#define PLAYOUT_DELAY_MAX_US         50000  // hard cap -- never add more than 50ms. Kept well under the
+                                             // ~200ms the video socket's receive buffer can absorb (see
+                                             // above) since this now runs on the same thread that drains
+                                             // that socket, unlike the abandoned queued-decode-thread
+                                             // design which could afford a 100ms cap.
 #define PLAYOUT_RESYNC_THRESHOLD_US  150000 // give up on the schedule only past this much lateness
+#define PLAYOUT_POST_RESYNC_GRACE_US 200000 // no delay at all for this long after any resync (including
+                                             // the very first frame of a connection). A resync means we
+                                             // just fell badly behind (a real stall/pause) -- on the
+                                             // DIRECT_SUBMIT path, the frames right after very often
+                                             // arrive as a back-to-back burst already sitting in the
+                                             // socket buffer, and individually re-pacing each one back to
+                                             // nominal cadence would mean this thread -- which also reads
+                                             // that socket -- spends the whole burst duration asleep
+                                             // instead of draining it. Skipping delay for a while after
+                                             // any resync lets the burst drain immediately instead.
 #define PLAYOUT_STATUS_LOG_FRAMES    120    // ~every 2s at 60fps -- tuning visibility, not spam
 #define PLAYOUT_DELAY_MAX_STEP_US    1500   // v4 bug: the raw jitter estimate can jump by tens of ms in
                                              // one step (that's the point of its fast-growth EWMA), and
@@ -104,8 +138,7 @@ static bool idrFrameProcessed;
                                              // 155 stalls even after jitter calmed to 2-8ms late in a
                                              // test run). This caps how fast the *applied* delay can move
                                              // per frame, decoupled from how fast the estimate itself
-                                             // reacts -- ~1.5ms/frame reaches the 100ms cap in ~1s, which
-                                             // is fast enough to adapt without perturbing steady-state gaps.
+                                             // reacts.
 #define RTP_CLOCK_RATE_HZ            90000  // fixed by the Moonlight/GameStream RTP profile
 static bool havePrevFrameTiming;
 static uint64_t prevFrameReceiveTimeUs;
@@ -117,6 +150,7 @@ static unsigned int playoutStatusLogCounter;
 static bool havePlayoutAnchor;
 static uint64_t playoutAnchorLocalUs;
 static uint32_t playoutAnchorRtpTimestamp;
+static uint64_t lastResyncLocalUs;
 
 // Converts a duration expressed in 90kHz RTP clock ticks to microseconds.
 static uint64_t rtpTicksToUs(uint32_t deltaTicks) {
@@ -204,6 +238,15 @@ static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimesta
         playoutAnchorRtpTimestamp = rtpTimestamp;
         playoutAnchorLocalUs = receiveTimeUs;
         havePlayoutAnchor = true;
+        lastResyncLocalUs = now;
+    }
+
+    // See PLAYOUT_POST_RESYNC_GRACE_US's doc comment above: skip delay
+    // entirely for a while after any resync, so a burst of already-arrived
+    // frames right after a stall drains immediately instead of each being
+    // individually re-paced back to nominal cadence.
+    if (now - lastResyncLocalUs < PLAYOUT_POST_RESYNC_GRACE_US) {
+        return 0;
     }
 
     uint64_t rawScheduleUs = playoutAnchorLocalUs + rtpTicksToUs((uint32_t)(rtpTimestamp - playoutAnchorRtpTimestamp));
@@ -225,6 +268,7 @@ static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimesta
         Limelog("PlayoutBuffer: resync after %llums of drift\n", (unsigned long long)(lateByUs / 1000));
         playoutAnchorRtpTimestamp = rtpTimestamp;
         playoutAnchorLocalUs = receiveTimeUs;
+        lastResyncLocalUs = now;
     }
     return 0;
 }
@@ -293,6 +337,7 @@ void initializeVideoDepacketizer(int pktSize) {
     havePlayoutAnchor = false;
     playoutAnchorLocalUs = 0;
     playoutAnchorRtpTimestamp = 0;
+    lastResyncLocalUs = 0;
 }
 
 // Free the NAL chain
@@ -774,6 +819,17 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 }
             }
             else {
+                // Adaptive playout delay -- see the design comment above
+                // playoutDelayForFrame(). This runs on the RTP receive thread
+                // itself here (DIRECT_SUBMIT), so the sleep also delays
+                // draining the video socket, not just presentation -- see
+                // that same comment for why PLAYOUT_DELAY_MAX_US and
+                // PLAYOUT_POST_RESYNC_GRACE_US are sized the way they are.
+                uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+                if (delayUs > 0) {
+                    PltSleepMs((int)(delayUs / 1000));
+                }
+
                 // Submit the frame to the decoder
                 validateDecodeUnitForPlayback(&qdu->decodeUnit);
                 LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
