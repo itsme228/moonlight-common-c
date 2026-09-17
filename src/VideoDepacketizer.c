@@ -360,6 +360,25 @@ static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimesta
         // fix below, so it can't itself perturb frame-to-frame release gaps.
         if (rawScheduleUs > now + PLAYOUT_RAW_LEAD_ALLOWANCE_US) {
             uint64_t excessLeadUs = rawScheduleUs - now - PLAYOUT_RAW_LEAD_ALLOWANCE_US;
+
+            // Symmetric with the lateByUs resync further below: without this,
+            // a large one-off lead (startup buffering, a resolution/IDR
+            // restart, or a big jitter spike baked into the anchor) only ever
+            // drains at PLAYOUT_DELAY_MAX_STEP_US per frame -- ~90ms of
+            // correction per real second at 60fps, so a 2-3s excess lead
+            // visibly takes 20-30s to fully resolve into low latency. Snap
+            // the anchor immediately once the lead is large enough to mean a
+            // real stale reference rather than ordinary jitter, exactly like
+            // the late-side resync already does; small leads still just get
+            // the slow, non-perturbing nudge below.
+            if (excessLeadUs > PLAYOUT_RESYNC_THRESHOLD_US) {
+                Limelog("PlayoutBuffer: resync after %llums of excess lead\n", (unsigned long long)(excessLeadUs / 1000));
+                playoutAnchorRtpTimestamp = rtpTimestamp;
+                playoutAnchorLocalUs = receiveTimeUs;
+                lastResyncLocalUs = now;
+                return 0;
+            }
+
             uint64_t nudge = (excessLeadUs > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : excessLeadUs;
             playoutAnchorLocalUs -= nudge;
         }
