@@ -155,6 +155,33 @@ static int64_t networkJitterUs;
 static uint64_t appliedPlayoutDelayUs;
 static unsigned int playoutStatusLogCounter;
 
+// How long the DIRECT_SUBMIT path's own adaptive-delay sleep (see the call
+// site in reassembleFrame() below) ran for on the *previous* frame -- i.e.
+// exactly how much later this frame's own recvUdpSocket() call (VideoStream.c)
+// returned than it would have if this thread hadn't been asleep. Consumed
+// (and reset to 0) the next time updatePlayoutJitterEstimate() runs.
+//
+// Without this, that self-inflicted delay was indistinguishable from real
+// network jitter: receiveTimeUs is stamped right after recvUdpSocket()
+// returns, which on a datagram socket returns whatever's already sitting in
+// the kernel buffer the instant it's called -- so a packet that arrived on
+// time still gets read (and timestamped) late if this thread was sleeping
+// instead of calling recv(). That measured "lateness" then fed straight
+// into networkJitterUs, which increased the delay for the *next* frame too,
+// which delayed reading *that* frame's packet by roughly the same amount,
+// which measured as more "jitter" -- a closed feedback loop with no real
+// network condition driving it at all. Confirmed live: jitter pinned at the
+// hard cap (PLAYOUT_DELAY_MAX_US, logged as "jitter=149083us" -- past the
+// cap itself, EWMA overshoot before clamping downstream) indefinitely on an
+// otherwise clean, loss-free local connection (server-side pipeline timing
+// steady at ~16.7ms/frame, zero client-reported packet loss), with the
+// client's own delivered-fps counter consequently dropping to ~22fps against
+// a 60fps target -- the "plays a second, stalls a second" pattern this was
+// chasing. Subtracting out the known self-inflicted portion before it
+// reaches the estimator breaks the loop: only genuine transit-time variance
+// can grow it from here.
+static uint64_t selfInflictedDelayUs;
+
 static bool havePlayoutAnchor;
 static uint64_t playoutAnchorLocalUs;
 static uint32_t playoutAnchorRtpTimestamp;
@@ -217,6 +244,13 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
         if (rtpDeltaTicks > 0) {
             int64_t rtpDeltaUs = (int64_t)rtpTicksToUs((uint32_t)rtpDeltaTicks);
             int64_t receiveDeltaUs = (int64_t)(receiveTimeUs - prevFrameReceiveTimeUs);
+            // Strip out this thread's own previous-frame sleep before it can
+            // be mistaken for real transit-time variance -- see
+            // selfInflictedDelayUs's doc comment.
+            receiveDeltaUs -= (int64_t)selfInflictedDelayUs;
+            if (receiveDeltaUs < 0) {
+                receiveDeltaUs = 0;
+            }
             int64_t transitDeltaUs = receiveDeltaUs - rtpDeltaUs;
             if (transitDeltaUs < 0) {
                 transitDeltaUs = -transitDeltaUs;
@@ -230,6 +264,9 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
     prevFrameReceiveTimeUs = receiveTimeUs;
     prevFrameRtpTimestamp = rtpTimestamp;
     havePrevFrameTiming = true;
+    // Consumed above (or not applicable this call, e.g. no valid rtpDeltaTicks)
+    // -- either way it's now stale for the *next* frame's own measurement.
+    selfInflictedDelayUs = 0;
 
     if (++playoutStatusLogCounter >= PLAYOUT_STATUS_LOG_FRAMES) {
         playoutStatusLogCounter = 0;
@@ -433,6 +470,7 @@ void initializeVideoDepacketizer(int pktSize) {
     networkJitterUs = 0;
     appliedPlayoutDelayUs = 0;
     playoutStatusLogCounter = 0;
+    selfInflictedDelayUs = 0;
 
     havePlayoutAnchor = false;
     playoutAnchorLocalUs = 0;
@@ -949,6 +987,14 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                     }
                 }
                 uint64_t tSleepEnd = PltGetMicroseconds();
+                // Record how long we actually slept (post-bailout, so this
+                // reflects reality even when isVideoRtpDataPending() cut it
+                // short) so the *next* frame's jitter measurement can
+                // subtract it back out -- see selfInflictedDelayUs's doc
+                // comment. Accumulates rather than overwrites in case
+                // anything else adds to it before the next
+                // updatePlayoutJitterEstimate() call consumes it.
+                selfInflictedDelayUs += (tSleepEnd - tPlayout1);
 
                 // Submit the frame to the decoder
                 validateDecodeUnitForPlayback(&qdu->decodeUnit);
