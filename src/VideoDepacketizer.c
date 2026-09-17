@@ -929,7 +929,24 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
                 uint64_t tPlayout1 = PltGetMicroseconds();
                 if (delayUs > 0) {
-                    PltSleepMs((int)(delayUs / 1000));
+                    // Sleep in small chunks instead of one shot, bailing out
+                    // the moment a new packet is already waiting on the
+                    // socket -- see isVideoRtpDataPending()'s doc comment for
+                    // why: this thread also drains that socket, so cutting
+                    // this frame's own (possibly real, jitter-driven) delay
+                    // short to go read a packet that's already arrived can
+                    // only help, never hurt -- we were never going to beat
+                    // that packet's own arrival time anyway.
+                    uint64_t remainingUs = delayUs;
+                    while (remainingUs > 0) {
+                        uint64_t chunkUs = (remainingUs > 2000) ? 2000 : remainingUs;
+                        int chunkMs = (int)(chunkUs / 1000);
+                        PltSleepMs(chunkMs > 0 ? chunkMs : 1);
+                        remainingUs = (remainingUs > chunkUs) ? (remainingUs - chunkUs) : 0;
+                        if (isVideoRtpDataPending()) {
+                            break;
+                        }
+                    }
                 }
                 uint64_t tSleepEnd = PltGetMicroseconds();
 

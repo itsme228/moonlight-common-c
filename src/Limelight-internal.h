@@ -138,6 +138,7 @@ void notifyFrameLost(unsigned int frameNumber, bool speculative);
 void initializeVideoStream(void);
 void destroyVideoStream(void);
 void notifyKeyFrameReceived(void);
+bool isVideoRtpDataPending(void);
 int startVideoStream(void* rendererContext, int drFlags);
 void stopVideoStream(void);
 

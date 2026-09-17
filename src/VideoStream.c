@@ -81,6 +81,35 @@ static void VideoPingThreadProc(void* context) {
     }
 }
 
+// Non-blocking check for whether the next video packet has already
+// arrived on rtpSocket. Used by the DIRECT_SUBMIT adaptive playout delay
+// (see playoutDelayForFrame() in VideoDepacketizer.c) to cut its own sleep
+// short instead of blindly sleeping the full computed delay: that delay
+// runs on this same receive thread, so on a persistently jittery link
+// (chronic multi-ms jitter, not just occasional spikes) it was chronically
+// eating into the time this thread has to drain the socket, and pending
+// data piling up behind an already-late thread just makes it later --
+// exactly backwards from what the delay is for. Confirmed live: sustained
+// ~5-25ms measured jitter over Wi-Fi produced a ~5-25ms sleep on *every*
+// frame indefinitely, not just transient spikes, which the buffer's
+// original 2MB/~200ms socket-backlog margin was never sized to absorb as
+// a steady-state cost -- it manifested as constant "not draining socket"
+// stalls and RFI/IDR storms from the very first frame of the session,
+// unrelated to any other load on the machine.
+bool isVideoRtpDataPending(void) {
+    struct pollfd pfd;
+
+    if (rtpSocket == INVALID_SOCKET) {
+        return false;
+    }
+
+    pfd.fd = rtpSocket;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    return pollSockets(&pfd, 1, 0) > 0;
+}
+
 // Receive thread proc
 static void VideoReceiveThreadProc(void* context) {
     int err;
