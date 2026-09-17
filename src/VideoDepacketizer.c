@@ -139,6 +139,14 @@ static bool idrFrameProcessed;
                                              // test run). This caps how fast the *applied* delay can move
                                              // per frame, decoupled from how fast the estimate itself
                                              // reacts.
+#define PLAYOUT_RAW_LEAD_ALLOWANCE_US 3000  // how far the RAW schedule (before this frame's own
+                                             // adaptive margin) may sit ahead of "now" before it's
+                                             // treated as a stale anchor artifact instead of normal
+                                             // jitter -- see the v9 fix at the "now < idealReleaseUs"
+                                             // branch below. Set well above real measured transit-time
+                                             // variance on a clean link (recvToEnqueue ~15-30us) but
+                                             // well below a single frame interval, so it never fights
+                                             // the deliberate jitter margin on a genuinely noisy link.
 #define RTP_CLOCK_RATE_HZ            90000  // fixed by the Moonlight/GameStream RTP profile
 static bool havePrevFrameTiming;
 static uint64_t prevFrameReceiveTimeUs;
@@ -291,22 +299,76 @@ static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimesta
     uint64_t idealReleaseUs = rawScheduleUs + advancePlayoutDelayUs();
 
     if (now < idealReleaseUs) {
+        // v9 bug (found live on a real point-to-point cable link after the
+        // late-side fix above landed): the anchor's own one-time reference
+        // transit delay -- sampled from whichever single frame happened to
+        // set it (connection start, or the frame right after a resync) --
+        // can itself be anomalously large (e.g. RTSP/session-setup overhead
+        // racing the first video packet). Unlike genuine per-frame jitter,
+        // that one-off excess gets baked into rawScheduleUs for every
+        // subsequent frame with NO existing correction path: the resync/
+        // nudge logic further below only ever fires when we're running LATE
+        // against the schedule, never when we're persistently AHEAD of it.
+        // Confirmed live: jitter/applied stayed small (~1-3ms, no resyncs)
+        // yet every single frame still measured a consistent ~13-17ms
+        // mandatory sleep -- far more than the measured real transit-time
+        // variance (recvToEnqueue ~15-30us) could ever justify, i.e. this
+        // was schedule lead baked in at the anchor, not real buffering.
+        //
+        // If the RAW schedule (before this frame's own small adaptive
+        // margin) is already ahead of "now" by more than a small allowance
+        // for genuine jitter, gradually pull the anchor's local-time
+        // reference earlier so future frames' schedule catches back down to
+        // real transit time -- same bounded per-frame step as the late-side
+        // fix below, so it can't itself perturb frame-to-frame release gaps.
+        if (rawScheduleUs > now + PLAYOUT_RAW_LEAD_ALLOWANCE_US) {
+            uint64_t excessLeadUs = rawScheduleUs - now - PLAYOUT_RAW_LEAD_ALLOWANCE_US;
+            uint64_t nudge = (excessLeadUs > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : excessLeadUs;
+            playoutAnchorLocalUs -= nudge;
+        }
         return idealReleaseUs - now;
     }
 
     // This frame's slot already passed. A small miss is normal jitter --
     // release immediately but leave the anchor alone, so the schedule (and
     // its buffering margin) survives for the next frame. Only give up and
-    // re-anchor here if the miss is large enough to mean a real stall or
-    // pause, not just jitter -- otherwise every jittery period would keep
-    // resetting the schedule right when it's needed most (see the v2
-    // design note above).
+    // fully re-anchor here if the miss is large enough to mean a real stall
+    // or pause, not just jitter -- otherwise every jittery period would keep
+    // resetting the schedule right when it's needed most (see the v2 design
+    // note above).
     uint64_t lateByUs = now - idealReleaseUs;
     if (lateByUs > PLAYOUT_RESYNC_THRESHOLD_US) {
         Limelog("PlayoutBuffer: resync after %llums of drift\n", (unsigned long long)(lateByUs / 1000));
         playoutAnchorRtpTimestamp = rtpTimestamp;
         playoutAnchorLocalUs = receiveTimeUs;
         lastResyncLocalUs = now;
+    }
+    else if (lateByUs > 0) {
+        // v8 bug (found live on a real point-to-point cable link with
+        // near-zero actual network jitter, confirmed absent on WiFi where
+        // this buffer was originally tuned): any lateness under the resync
+        // threshold above was previously accepted and never corrected -- the
+        // anchor only moves on a >150ms drift, so a moderate offset that
+        // crept in just once (e.g. during connection startup, before
+        // anything had a chance to trigger a real resync) stayed baked into
+        // every subsequent frame's schedule for the rest of the session: a
+        // fixed, smooth-but-permanent extra delay, not jitter -- reported
+        // live as a stable ~200-300ms perceived lag that vanished entirely
+        // once this buffer was removed outright. On WiFi this was masked
+        // because real jitter crosses the 150ms resync threshold often
+        // enough on its own to keep re-correcting the schedule; a clean
+        // cable link rarely does, so a bad offset can persist indefinitely.
+        //
+        // A full resync here (like v2's mistake above) would itself perturb
+        // release timing every time normal jitter causes a small miss, so
+        // instead nudge just the anchor's local-time reference forward by a
+        // small slew-limited step -- same technique and step size already
+        // proven safe in production for appliedPlayoutDelayUs's own ramp
+        // (PLAYOUT_DELAY_MAX_STEP_US) -- so persistent lateness drains away
+        // over roughly a second instead of being locked in until a
+        // catastrophic stall happens to trigger a full resync.
+        uint64_t nudge = (lateByUs > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : lateByUs;
+        playoutAnchorLocalUs += nudge;
     }
     return 0;
 }
