@@ -276,6 +276,20 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
     }
 }
 
+// LiGetPlayoutJitterUs/LiGetPlayoutAppliedDelayUs expose the same two
+// numbers this file already logs periodically above, for a live HUD (see
+// net_graph.go) instead of only ever appearing in the log file.
+// networkJitterUs is signed only to make updatePlayoutJitterEstimate's own
+// exponential-decay math convenient -- it is never actually negative once
+// havePrevFrameTiming is true, but clamp anyway rather than trust that.
+uint64_t LiGetPlayoutJitterUs(void) {
+    return (uint64_t)(networkJitterUs < 0 ? 0 : networkJitterUs);
+}
+
+uint64_t LiGetPlayoutAppliedDelayUs(void) {
+    return appliedPlayoutDelayUs;
+}
+
 // Returns how long (in microseconds, possibly 0) the caller should wait
 // before releasing this already-dequeued frame to the decoder, and advances
 // the playout schedule. See the design comment above for the anchoring and

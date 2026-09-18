@@ -569,6 +569,15 @@ const char* LiGetStageName(int stage);
 // This function may only be called between LiStartConnection() and LiStopConnection().
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
 
+// These return the client-side adaptive playout buffer's live jitter
+// estimate and currently-applied delay (see VideoDepacketizer.c's own
+// PlayoutBuffer status log for the same numbers) -- client-observed
+// arrival-time variance, distinct from LiGetEstimatedRttInfo's network RTT
+// variance. Both in microseconds; 0 before the first frame's jitter
+// estimate has anything to measure against.
+uint64_t LiGetPlayoutJitterUs(void);
+uint64_t LiGetPlayoutAppliedDelayUs(void);
+
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
 
