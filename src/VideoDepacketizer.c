@@ -112,12 +112,32 @@ static bool idrFrameProcessed;
 #define PLAYOUT_JITTER_SHIFT_GROW    2      // fast growth on a real jitter spike (~1/4 weight)
 #define PLAYOUT_JITTER_SHIFT_DECAY   6      // slow decay back down (~1/64 weight) once it's calm again
 #define PLAYOUT_DELAY_MULTIPLIER     3      // target delay = jitter estimate * this
-#define PLAYOUT_DELAY_MAX_US         50000  // hard cap -- never add more than 50ms. Kept well under the
-                                             // ~200ms the video socket's receive buffer can absorb (see
-                                             // above) since this now runs on the same thread that drains
-                                             // that socket, unlike the abandoned queued-decode-thread
-                                             // design which could afford a 100ms cap.
-#define PLAYOUT_RESYNC_THRESHOLD_US  150000 // give up on the schedule only past this much lateness
+#define PLAYOUT_DELAY_MAX_US         100000 // hard cap -- never add more than 100ms. Was 50ms, raised
+                                             // 2026-09-19: live on a genuinely bad-wifi connection,
+                                             // networkJitterUs itself (not even the x3 target) sat at
+                                             // 41000-60000us for sustained periods ("PlayoutBuffer:
+                                             // jitter=58597us target=50000us applied=50000us" in app.log)
+                                             // -- the x3-multiplier target wanted 120000-180000us and was
+                                             // being clamped to less than half that, so genuine jitter of
+                                             // that scale was passing straight through as stalls (feeding
+                                             // frame_smoothing.go's concealment) instead of being absorbed.
+                                             // 100ms matches the exact figure this file's own older comment
+                                             // already called safe for a similar design (the abandoned
+                                             // queued-decode-thread one) and stays well under the ~200ms
+                                             // the video socket's receive buffer can absorb (see above)
+                                             // even though this one runs on the same thread that drains
+                                             // that socket.
+#define PLAYOUT_RESYNC_THRESHOLD_US  200000 // give up on the schedule only past this much lateness.
+                                             // Was 150000 when PLAYOUT_DELAY_MAX_US was 50000 (100ms of
+                                             // margin above the max applied delay before giving up).
+                                             // Raising the delay cap to 100000 without raising this shrank
+                                             // that margin to 50ms, and live testing (2026-09-19, a stream
+                                             // with its own severe server-side frame-delivery shortfall --
+                                             // "Sunshine sending less than requested", 6-15fps of a 30fps
+                                             // target) hit it constantly: 39 resyncs in ~12s, alternating
+                                             // excess-lead/drift, each one a disruptive re-anchor -- visible
+                                             // as a regression ("stopped working on the other stream").
+                                             // 200000 restores the original 100ms margin above the new cap.
 #define PLAYOUT_POST_RESYNC_GRACE_US 200000 // no delay at all for this long after any resync (including
                                              // the very first frame of a connection). A resync means we
                                              // just fell badly behind (a real stall/pause) -- on the
@@ -270,9 +290,17 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
 
     if (++playoutStatusLogCounter >= PLAYOUT_STATUS_LOG_FRAMES) {
         playoutStatusLogCounter = 0;
-        Limelog("PlayoutBuffer: jitter=%lldus target=%lluus applied=%lluus\n",
-                (long long)networkJitterUs, (unsigned long long)targetPlayoutDelayUs(),
-                (unsigned long long)appliedPlayoutDelayUs);
+        // DEBUG: rawWantedUs is jitter*MULTIPLIER before the PLAYOUT_DELAY_MAX_US
+        // clamp -- logged unclamped so it's visible from app.log alone whether
+        // the cap is still limiting the buffer on a given connection (rawWantedUs
+        // > target means yes, by rawWantedUs-target), without having to
+        // reconstruct it from networkJitterUs by hand.
+        int64_t rawWantedUs = (int64_t)networkJitterUs * PLAYOUT_DELAY_MULTIPLIER;
+        if (rawWantedUs < 0) rawWantedUs = 0;
+        Limelog("PlayoutBuffer: jitter=%lldus rawWanted=%lldus target=%lluus applied=%lluus clamped=%s\n",
+                (long long)networkJitterUs, (long long)rawWantedUs, (unsigned long long)targetPlayoutDelayUs(),
+                (unsigned long long)appliedPlayoutDelayUs,
+                (rawWantedUs > (int64_t)PLAYOUT_DELAY_MAX_US) ? "YES" : "no");
     }
 }
 
