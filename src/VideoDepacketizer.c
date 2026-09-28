@@ -207,6 +207,19 @@ static uint64_t playoutAnchorLocalUs;
 static uint32_t playoutAnchorRtpTimestamp;
 static uint64_t lastResyncLocalUs;
 
+// USBRIDGE_PLAYOUT_BUFFER=0 releases every frame to the decoder the moment
+// it's reassembled, like upstream moonlight-common-c (the jitter estimate
+// keeps running, so the Net Graph numbers stay live). For A/B-testing the
+// buffer against a stock-Moonlight-style pipeline.
+static bool playoutBufferDisabled(void) {
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char* v = getenv("USBRIDGE_PLAYOUT_BUFFER");
+        disabled = (v != NULL && strcmp(v, "0") == 0) ? 1 : 0;
+    }
+    return disabled != 0;
+}
+
 // Converts a duration expressed in 90kHz RTP clock ticks to microseconds.
 static uint64_t rtpTicksToUs(uint32_t deltaTicks) {
     return ((uint64_t)deltaTicks * 1000ULL) / (RTP_CLOCK_RATE_HZ / 1000);
@@ -1026,6 +1039,9 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 // PLAYOUT_POST_RESYNC_GRACE_US are sized the way they are.
                 uint64_t tPlayout0 = PltGetMicroseconds();
                 uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+                if (playoutBufferDisabled()) {
+                    delayUs = 0;
+                }
                 uint64_t tPlayout1 = PltGetMicroseconds();
                 if (delayUs > 0) {
                     // Sleep in small chunks instead of one shot, bailing out
