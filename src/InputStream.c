@@ -615,6 +615,59 @@ static void inputSendThreadProc(void* context) {
     }
 }
 
+int LiSendRawHidEvent(uint8_t kind, uint8_t slot, uint8_t endpoint, uint16_t total, uint16_t offset,
+                      const uint8_t* data, uint16_t length, bool reliable) {
+    PPACKET_HOLDER holder;
+    PUB_RAW_HID_PACKET packet;
+    int err;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    // This is a USBridge protocol extension
+    if (!(SunshineFeatureFlags & LI_FF_USBRIDGE_RAW_HID)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (length > LI_RAW_HID_MAX_CHUNK || (length != 0 && data == NULL)) {
+        return -1;
+    }
+
+    holder = allocatePacketHolder((int)(sizeof(UB_RAW_HID_PACKET) + length));
+    if (holder == NULL) {
+        return -1;
+    }
+
+    // Everything shares the pen channel so reports stay ordered behind the
+    // model chunks.
+    holder->channelId = CTRL_CHANNEL_PEN;
+    holder->enetPacketFlags = reliable ? ENET_PACKET_FLAG_RELIABLE : 0;
+
+    packet = (PUB_RAW_HID_PACKET)&holder->packet;
+    packet->header.size = BE32((uint32_t)(sizeof(UB_RAW_HID_PACKET) - sizeof(packet->data) - sizeof(uint32_t) + length));
+    packet->header.magic = LE32(UB_RAW_HID_MAGIC);
+    packet->kind = kind;
+    packet->slot = slot;
+    packet->endpoint = endpoint;
+    packet->reserved = 0;
+    packet->total = LE16(total);
+    packet->offset = LE16(offset);
+    packet->length = LE16(length);
+    if (length != 0) {
+        memcpy(packet->data, data, length);
+    }
+
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
+    }
+
+    return err;
+}
+
 // This function tells GFE that we support haptics and it should send rumble events to us
 static int sendEnableHaptics(void) {
     PPACKET_HOLDER holder;

@@ -690,6 +690,29 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
                    float contactAreaMajor, float contactAreaMinor,
                    uint16_t rotation, uint8_t tilt);
 
+// USBridge extension: sends one chunk of a raw HID device to the host, which
+// rebuilds it as a virtual USB device for its native driver.
+//
+// LI_RAW_HID_MODEL carries the device model (descriptors and feature reports).
+// LI_RAW_HID_REPORT carries an input report of the interrupt endpoint 'endpoint'.
+// Both are sent in chunks of at most LI_RAW_HID_MAX_CHUNK bytes: 'total' is the
+// full size and 'offset' this chunk's position. LI_RAW_HID_DETACH unplugs the
+// device. 'slot' tells several devices apart.
+//
+// Model chunks, a detach and every chunk of a report that needs more than one
+// must be reliable. A report that fits one chunk may be sent unreliably when a
+// newer one will replace it anyway (a pen in motion); the host then never waits
+// for a lost one.
+//
+// To determine if this is supported without calling it, call LiGetHostFeatureFlags()
+// and check for the LI_FF_USBRIDGE_RAW_HID flag.
+#define LI_RAW_HID_MODEL  0x00
+#define LI_RAW_HID_REPORT 0x01
+#define LI_RAW_HID_DETACH 0x02
+#define LI_RAW_HID_MAX_CHUNK 64
+int LiSendRawHidEvent(uint8_t kind, uint8_t slot, uint8_t endpoint, uint16_t total, uint16_t offset,
+                      const uint8_t* data, uint16_t length, bool reliable);
+
 // This function queues a mouse button event to be sent to the remote server.
 #define BUTTON_ACTION_PRESS 0x07
 #define BUTTON_ACTION_RELEASE 0x08
@@ -1025,6 +1048,7 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_USBRIDGE_RAW_HID        0x10000 // LiSendRawHidEvent() supported (USBridge hosts)
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus

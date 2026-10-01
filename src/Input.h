@@ -154,6 +154,22 @@ typedef struct _SS_PEN_PACKET {
     netfloat contactAreaMinor;
 } SS_PEN_PACKET, *PSS_PEN_PACKET;
 
+// USBridge extension: one chunk of a raw HID device (descriptors or an input
+// report) for the host to rebuild as a virtual USB device. Not part of the
+// Sunshine protocol; only sent when the host sets LI_FF_USBRIDGE_RAW_HID.
+#define UB_RAW_HID_MAGIC 0x55420001
+typedef struct _UB_RAW_HID_PACKET {
+    NV_INPUT_HEADER header;
+    uint8_t kind;
+    uint8_t slot;
+    uint8_t endpoint;
+    uint8_t reserved;
+    uint16_t total;  // Little Endian
+    uint16_t offset; // Little Endian
+    uint16_t length; // Little Endian
+    uint8_t data[1]; // length bytes
+} UB_RAW_HID_PACKET, *PUB_RAW_HID_PACKET;
+
 #define SS_CONTROLLER_ARRIVAL_MAGIC 0x55000004
 typedef struct _SS_CONTROLLER_ARRIVAL_PACKET {
     NV_INPUT_HEADER header;
