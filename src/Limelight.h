@@ -232,11 +232,16 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_AV1_MAIN10      0x2000 // AV1 Main 10-bit profile
 #define VIDEO_FORMAT_AV1_HIGH8_444   0x4000 // AV1 High 4:4:4 8-bit profile
 #define VIDEO_FORMAT_AV1_HIGH10_444  0x8000 // AV1 High 4:4:4 10-bit profile
+// USBridge extension: PyroWave, an intra-only wavelet codec decoded with Vulkan compute.
+// Negotiated only with a host whose DESCRIBE reply carries "PYROWAVE/90000"; every frame
+// is a keyframe and the decode unit is one opaque PyroWave packet.
+#define VIDEO_FORMAT_PYROWAVE        0x10000 // PyroWave 4:2:0 8-bit
 
 // Masks for clients to use to match video codecs without profile-specific details.
 #define VIDEO_FORMAT_MASK_H264   0x000F
 #define VIDEO_FORMAT_MASK_H265   0x0F00
 #define VIDEO_FORMAT_MASK_AV1    0xF000
+#define VIDEO_FORMAT_MASK_PYROWAVE 0x10000
 #define VIDEO_FORMAT_MASK_10BIT  0xAA00
 #define VIDEO_FORMAT_MASK_YUV444 0xCC04
 
