@@ -313,7 +313,7 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
         if (rawWantedUs < 0) rawWantedUs = 0;
         Limelog("PlayoutBuffer: jitter=%lldus rawWanted=%lldus target=%lluus applied=%lluus clamped=%s\n",
                 (long long)networkJitterUs, (long long)rawWantedUs, (unsigned long long)targetPlayoutDelayUs(),
-                (unsigned long long)appliedPlayoutDelayUs,
+                (unsigned long long)LiGetPlayoutAppliedDelayUs(),
                 (rawWantedUs > (int64_t)PLAYOUT_DELAY_MAX_US) ? "YES" : "no");
     }
 }
@@ -328,8 +328,11 @@ uint64_t LiGetPlayoutJitterUs(void) {
     return (uint64_t)(networkJitterUs < 0 ? 0 : networkJitterUs);
 }
 
+// With USBRIDGE_PLAYOUT_BUFFER=0 the schedule is still computed (it keeps
+// the jitter estimate honest) but never slept on, so the delay actually
+// applied is zero -- report that, not the would-be value.
 uint64_t LiGetPlayoutAppliedDelayUs(void) {
-    return appliedPlayoutDelayUs;
+    return playoutBufferDisabled() ? 0 : appliedPlayoutDelayUs;
 }
 
 // Returns how long (in microseconds, possibly 0) the caller should wait
