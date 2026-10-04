@@ -209,15 +209,16 @@ static uint64_t lastResyncLocalUs;
 
 // USBRIDGE_PLAYOUT_BUFFER=0 releases every frame to the decoder the moment
 // it's reassembled, like upstream moonlight-common-c (the jitter estimate
-// keeps running, so the Net Graph numbers stay live). For A/B-testing the
-// buffer against a stock-Moonlight-style pipeline.
+// keeps running, so the Net Graph numbers stay live). Re-read at the start of
+// every stream (initializeVideoDepacketizer), so a client can flip it between
+// sessions -- the Windows client drives it from a video settings checkbox.
+static int playoutBufferDisabledCached = -1;
 static bool playoutBufferDisabled(void) {
-    static int disabled = -1;
-    if (disabled < 0) {
+    if (playoutBufferDisabledCached < 0) {
         const char* v = getenv("USBRIDGE_PLAYOUT_BUFFER");
-        disabled = (v != NULL && strcmp(v, "0") == 0) ? 1 : 0;
+        playoutBufferDisabledCached = (v != NULL && strcmp(v, "0") == 0) ? 1 : 0;
     }
-    return disabled != 0;
+    return playoutBufferDisabledCached != 0;
 }
 
 // Converts a duration expressed in 90kHz RTP clock ticks to microseconds.
@@ -520,6 +521,7 @@ typedef struct _LENTRY_INTERNAL {
 // Init
 void initializeVideoDepacketizer(int pktSize) {
     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
+    playoutBufferDisabledCached = -1;
 
     nextFrameNumber = 1;
     startFrameNumber = 0;
@@ -732,6 +734,9 @@ bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* deco
     // ever adds delay once the decoder has genuinely caught back up.
     if (LbqGetItemCount(&decodeUnitQueue) == 0) {
         uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+        if (playoutBufferDisabled()) {
+            delayUs = 0;
+        }
         if (delayUs > 0) {
             PltSleepMs((int)(delayUs / 1000));
         }
