@@ -1088,8 +1088,23 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         }
 
         if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) && strstr(response.payload, "PYROWAVE/90000")) {
-            // USBridge extension: the client asked for PyroWave and this host offers it
-            NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+            // USBridge extension: the client asked for PyroWave and this host offers it.
+            // The color upgrades only when the host also offers them right now (4:4:4 is
+            // license-gated on the host, so it can come and go).
+            bool host444 = strstr(response.payload, "a=x-usbridge-pyrowave:444") != NULL;
+            bool hostHdr = strstr(response.payload, "a=x-usbridge-pyrowave:hdr") != NULL;
+            if (host444 && hostHdr && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_444_HDR)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_444_HDR;
+            }
+            else if (hostHdr && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HDR)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HDR;
+            }
+            else if (host444 && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_444)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_444;
+            }
+            else {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+            }
         }
         else if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) && strstr(response.payload, "AV1/90000")) {
             if ((serverInfo->serverCodecModeSupport & SCM_AV1_HIGH10_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_HIGH10_444)) {
