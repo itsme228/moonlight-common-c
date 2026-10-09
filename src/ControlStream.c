@@ -707,11 +707,23 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
         PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
         PNVCTL_ENET_PACKET_HEADER_V2 packet;
         char tempBuffer[256];
+        // A larger message (USBridge camera chunks) gets a buffer of its own.
+        char* plainBuffer = tempBuffer;
+
+        if (sizeof(*packet) + paylen > sizeof(tempBuffer)) {
+            plainBuffer = malloc(sizeof(*packet) + paylen);
+            if (plainBuffer == NULL) {
+                return false;
+            }
+        }
 
         enetPacket = enet_packet_create(NULL,
                                         sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
                                         flags);
         if (enetPacket == NULL) {
+            if (plainBuffer != tempBuffer) {
+                free(plainBuffer);
+            }
             return false;
         }
 
@@ -725,8 +737,7 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
         encPacket->seq = currentEnetSequenceNumber++;
 
         // Construct the plaintext data for encryption
-        LC_ASSERT(sizeof(*packet) + paylen < sizeof(tempBuffer));
-        packet = (PNVCTL_ENET_PACKET_HEADER_V2)tempBuffer;
+        packet = (PNVCTL_ENET_PACKET_HEADER_V2)plainBuffer;
         packet->type = ptype;
         packet->payloadLength = paylen;
         memcpy(&packet[1], payload, paylen);
@@ -736,7 +747,13 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
             Limelog("Failed to encrypt control stream message\n");
             enet_packet_destroy(enetPacket);
             PltUnlockMutex(&enetMutex);
+            if (plainBuffer != tempBuffer) {
+                free(plainBuffer);
+            }
             return false;
+        }
+        if (plainBuffer != tempBuffer) {
+            free(plainBuffer);
         }
 
         // enetMutex still locked here

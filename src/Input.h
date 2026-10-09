@@ -192,6 +192,22 @@ typedef struct _UB_MIC_PACKET {
     uint8_t data[1];   // length bytes of Opus
 } UB_MIC_PACKET, *PUB_MIC_PACKET;
 
+// USBridge extension: one chunk of an H.264 access unit from the client's
+// camera, for the host to show as its own camera (a PC running the USBridge
+// agent: a virtual USB webcam). Only sent when the host sets
+// LI_FF_USBRIDGE_CAMERA.
+#define UB_CAMERA_MAGIC 0x55420004
+typedef struct _UB_CAMERA_PACKET {
+    NV_INPUT_HEADER header;
+    uint16_t frame;    // Little Endian, counts access units
+    uint8_t flags;     // LI_CAMERA_KEYFRAME
+    uint8_t reserved;
+    uint32_t total;    // Little Endian, size of the whole access unit
+    uint32_t offset;   // Little Endian, this chunk's position in it
+    uint16_t length;   // Little Endian
+    uint8_t data[1];   // length bytes
+} UB_CAMERA_PACKET, *PUB_CAMERA_PACKET;
+
 #define SS_CONTROLLER_ARRIVAL_MAGIC 0x55000004
 typedef struct _SS_CONTROLLER_ARRIVAL_PACKET {
     NV_INPUT_HEADER header;

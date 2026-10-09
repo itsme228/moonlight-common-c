@@ -755,6 +755,73 @@ int LiSendMicAudio(uint16_t sequence, const uint8_t* data, uint16_t length) {
     return err;
 }
 
+// Input packets the camera leaves free in the queue for everything else.
+#define CAMERA_QUEUE_RESERVE 30
+
+int LiSendCameraFrame(uint16_t frameNumber, uint8_t flags, const uint8_t* data, uint32_t length) {
+    uint32_t chunks;
+    uint32_t offset;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    // This is a USBridge protocol extension
+    // Chunks are bigger than the legacy (separately encrypted) input path
+    // takes; only the encrypted control stream carries them.
+    if (!(SunshineFeatureFlags & LI_FF_USBRIDGE_CAMERA) || !encryptedControlStream) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (length == 0 || length > LI_CAMERA_MAX_FRAME || data == NULL) {
+        return -1;
+    }
+
+    // All or nothing: a partial access unit is useless to the host.
+    chunks = (length + LI_CAMERA_MAX_CHUNK - 1) / LI_CAMERA_MAX_CHUNK;
+    if (LbqGetItemCount(&packetQueue) + chunks + CAMERA_QUEUE_RESERVE > MAX_QUEUED_INPUT_PACKETS) {
+        return LI_ERR_CAMERA_BUSY;
+    }
+
+    for (offset = 0; offset < length; offset += LI_CAMERA_MAX_CHUNK) {
+        PPACKET_HOLDER holder;
+        PUB_CAMERA_PACKET packet;
+        uint16_t chunk = (uint16_t)((length - offset) < LI_CAMERA_MAX_CHUNK ? (length - offset) : LI_CAMERA_MAX_CHUNK);
+        int err;
+
+        holder = allocatePacketHolder((int)(sizeof(UB_CAMERA_PACKET) + chunk));
+        if (holder == NULL) {
+            return -1;
+        }
+
+        // Unreliable on a channel of its own: a lost chunk must not hold up
+        // the next frames, nor any other input.
+        holder->channelId = CTRL_CHANNEL_CAMERA;
+        holder->enetPacketFlags = 0;
+
+        packet = (PUB_CAMERA_PACKET)&holder->packet;
+        packet->header.size = BE32((uint32_t)(sizeof(UB_CAMERA_PACKET) - sizeof(packet->data) - sizeof(uint32_t) + chunk));
+        packet->header.magic = LE32(UB_CAMERA_MAGIC);
+        packet->frame = LE16(frameNumber);
+        packet->flags = flags;
+        packet->reserved = 0;
+        packet->total = LE32(length);
+        packet->offset = LE32(offset);
+        packet->length = LE16(chunk);
+        memcpy(packet->data, data + offset, chunk);
+
+        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        if (err != LBQ_SUCCESS) {
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            Limelog("Input queue reached maximum size limit\n");
+            freePacketHolder(holder);
+            return LI_ERR_CAMERA_BUSY;
+        }
+    }
+
+    return 0;
+}
+
 // This function tells GFE that we support haptics and it should send rumble events to us
 static int sendEnableHaptics(void) {
     PPACKET_HOLDER holder;

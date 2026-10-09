@@ -745,6 +745,25 @@ int LiSendMidiEvent(const uint8_t* data, uint16_t length);
 #define LI_MIC_MAX_FRAME 200
 int LiSendMicAudio(uint16_t sequence, const uint8_t* data, uint16_t length);
 
+// USBridge extension: sends one H.264 access unit (Annex B, SPS/PPS with each
+// keyframe) of the client's camera to the host, which shows it as its own
+// camera. It goes out in chunks of LI_CAMERA_MAX_CHUNK bytes, unreliably: the
+// host drops an access unit with a chunk missing and waits for the next
+// keyframe. 'frameNumber' counts access units; 'flags' has LI_CAMERA_KEYFRAME
+// on a keyframe.
+//
+// Returns LI_ERR_CAMERA_BUSY without sending anything when the input queue
+// can't take the whole access unit (the network is behind); the caller should
+// skip frames and resume with a keyframe.
+//
+// To determine if this is supported without calling it, call LiGetHostFeatureFlags()
+// and check for the LI_FF_USBRIDGE_CAMERA flag.
+#define LI_CAMERA_KEYFRAME 0x01
+#define LI_CAMERA_MAX_CHUNK 1024
+#define LI_CAMERA_MAX_FRAME (1024 * 1024)
+#define LI_ERR_CAMERA_BUSY -5502
+int LiSendCameraFrame(uint16_t frameNumber, uint8_t flags, const uint8_t* data, uint32_t length);
+
 // This function queues a mouse button event to be sent to the remote server.
 #define BUTTON_ACTION_PRESS 0x07
 #define BUTTON_ACTION_RELEASE 0x08
@@ -1083,6 +1102,7 @@ void LiRequestIdrFrame(void);
 #define LI_FF_USBRIDGE_RAW_HID        0x10000 // LiSendRawHidEvent() supported (USBridge hosts)
 #define LI_FF_USBRIDGE_MIDI           0x20000 // LiSendMidiEvent() supported (USBridge hosts)
 #define LI_FF_USBRIDGE_MIC            0x40000 // LiSendMicAudio() supported (USBridge hosts)
+#define LI_FF_USBRIDGE_CAMERA         0x80000 // LiSendCameraFrame() supported (USBridge hosts)
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus
