@@ -724,6 +724,27 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
 int LiSendRawHidEvent(uint8_t kind, uint8_t slot, uint8_t endpoint, uint16_t total, uint16_t offset,
                       const uint8_t* data, uint16_t length, bool reliable);
 
+// USBridge extension: sends MIDI bytes from a client MIDI input to the host,
+// which plays them out of its MIDI device (on a NanoKVM: a USB MIDI port on
+// the target PC). 'data' holds whole MIDI messages, at most LI_MIDI_MAX_CHUNK
+// bytes; longer SysEx is split by the caller. Sent reliably and in order.
+//
+// To determine if this is supported without calling it, call LiGetHostFeatureFlags()
+// and check for the LI_FF_USBRIDGE_MIDI flag.
+#define LI_MIDI_MAX_CHUNK 128
+int LiSendMidiEvent(const uint8_t* data, uint16_t length);
+
+// USBridge extension: sends one Opus frame (48kHz, mono, at most
+// LI_MIC_MAX_FRAME bytes) of the client's microphone to the host, which plays
+// it into its microphone device (on a NanoKVM: the target PC's USB microphone).
+// Sent unreliably: a lost frame is concealed by the host's decoder.
+// 'sequence' counts frames, so the host can tell a loss from a gap.
+//
+// To determine if this is supported without calling it, call LiGetHostFeatureFlags()
+// and check for the LI_FF_USBRIDGE_MIC flag.
+#define LI_MIC_MAX_FRAME 200
+int LiSendMicAudio(uint16_t sequence, const uint8_t* data, uint16_t length);
+
 // This function queues a mouse button event to be sent to the remote server.
 #define BUTTON_ACTION_PRESS 0x07
 #define BUTTON_ACTION_RELEASE 0x08
@@ -1060,6 +1081,8 @@ void LiRequestIdrFrame(void);
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
 #define LI_FF_USBRIDGE_RAW_HID        0x10000 // LiSendRawHidEvent() supported (USBridge hosts)
+#define LI_FF_USBRIDGE_MIDI           0x20000 // LiSendMidiEvent() supported (USBridge hosts)
+#define LI_FF_USBRIDGE_MIC            0x40000 // LiSendMicAudio() supported (USBridge hosts)
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus

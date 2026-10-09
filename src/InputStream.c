@@ -668,6 +668,93 @@ int LiSendRawHidEvent(uint8_t kind, uint8_t slot, uint8_t endpoint, uint16_t tot
     return err;
 }
 
+int LiSendMidiEvent(const uint8_t* data, uint16_t length) {
+    PPACKET_HOLDER holder;
+    PUB_MIDI_PACKET packet;
+    int err;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    // This is a USBridge protocol extension
+    if (!(SunshineFeatureFlags & LI_FF_USBRIDGE_MIDI)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (length == 0 || length > LI_MIDI_MAX_CHUNK || data == NULL) {
+        return -1;
+    }
+
+    holder = allocatePacketHolder((int)(sizeof(UB_MIDI_PACKET) + length));
+    if (holder == NULL) {
+        return -1;
+    }
+
+    holder->channelId = CTRL_CHANNEL_MIDI;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
+
+    packet = (PUB_MIDI_PACKET)&holder->packet;
+    packet->header.size = BE32((uint32_t)(sizeof(UB_MIDI_PACKET) - sizeof(packet->data) - sizeof(uint32_t) + length));
+    packet->header.magic = LE32(UB_MIDI_MAGIC);
+    packet->length = LE16(length);
+    memcpy(packet->data, data, length);
+
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
+    }
+
+    return err;
+}
+
+int LiSendMicAudio(uint16_t sequence, const uint8_t* data, uint16_t length) {
+    PPACKET_HOLDER holder;
+    PUB_MIC_PACKET packet;
+    int err;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    // This is a USBridge protocol extension
+    if (!(SunshineFeatureFlags & LI_FF_USBRIDGE_MIC)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (length == 0 || length > LI_MIC_MAX_FRAME || data == NULL) {
+        return -1;
+    }
+
+    holder = allocatePacketHolder((int)(sizeof(UB_MIC_PACKET) + length));
+    if (holder == NULL) {
+        return -1;
+    }
+
+    // Unreliable on a channel of its own: a lost frame must not hold up
+    // the next ones (the host conceals it), nor any other input.
+    holder->channelId = CTRL_CHANNEL_MIC;
+    holder->enetPacketFlags = 0;
+
+    packet = (PUB_MIC_PACKET)&holder->packet;
+    packet->header.size = BE32((uint32_t)(sizeof(UB_MIC_PACKET) - sizeof(packet->data) - sizeof(uint32_t) + length));
+    packet->header.magic = LE32(UB_MIC_MAGIC);
+    packet->sequence = LE16(sequence);
+    packet->length = LE16(length);
+    memcpy(packet->data, data, length);
+
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
+    }
+
+    return err;
+}
+
 // This function tells GFE that we support haptics and it should send rumble events to us
 static int sendEnableHaptics(void) {
     PPACKET_HOLDER holder;

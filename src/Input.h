@@ -170,6 +170,28 @@ typedef struct _UB_RAW_HID_PACKET {
     uint8_t data[1]; // length bytes
 } UB_RAW_HID_PACKET, *PUB_RAW_HID_PACKET;
 
+// USBridge extension: MIDI bytes from a client's MIDI input, for the host to
+// play out of its own MIDI device (NanoKVM: the USB MIDI gadget). Only sent
+// when the host sets LI_FF_USBRIDGE_MIDI.
+#define UB_MIDI_MAGIC 0x55420002
+typedef struct _UB_MIDI_PACKET {
+    NV_INPUT_HEADER header;
+    uint16_t length; // Little Endian
+    uint8_t data[1]; // length bytes, whole MIDI messages
+} UB_MIDI_PACKET, *PUB_MIDI_PACKET;
+
+// USBridge extension: one Opus frame of the client's microphone (48kHz mono),
+// for the host to play into its own microphone device (NanoKVM: the UAC
+// gadget's capture side on the target PC). Only sent when the host sets
+// LI_FF_USBRIDGE_MIC.
+#define UB_MIC_MAGIC 0x55420003
+typedef struct _UB_MIC_PACKET {
+    NV_INPUT_HEADER header;
+    uint16_t sequence; // Little Endian
+    uint16_t length;   // Little Endian
+    uint8_t data[1];   // length bytes of Opus
+} UB_MIC_PACKET, *PUB_MIC_PACKET;
+
 #define SS_CONTROLLER_ARRIVAL_MAGIC 0x55000004
 typedef struct _SS_CONTROLLER_ARRIVAL_PACKET {
     NV_INPUT_HEADER header;

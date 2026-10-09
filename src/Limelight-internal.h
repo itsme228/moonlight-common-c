@@ -61,6 +61,8 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define CTRL_CHANNEL_PEN          0x04
 #define CTRL_CHANNEL_TOUCH        0x05
 #define CTRL_CHANNEL_UTF8         0x06
+#define CTRL_CHANNEL_MIDI         0x07 // USBridge extension
+#define CTRL_CHANNEL_MIC          0x08 // USBridge extension
 #define CTRL_CHANNEL_GAMEPAD_BASE 0x10 // 0x10 to 0x1F by controller index
 #define CTRL_CHANNEL_SENSOR_BASE  0x20 // 0x20 to 0x2F by controller index
 #define CTRL_CHANNEL_COUNT        0x30
