@@ -781,8 +781,12 @@ bool isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLe
 
 bool isPrivateNetworkAddress(struct sockaddr_storage* address) {
     if (address->ss_family == AF_INET) {
-        // 100.64.0.0/10 counts too: that's the tailnet, where the host's
-        // streamer sizes packets for the 1280 tunnel MTU (no 1024 cap).
+        // 100.64.0.0/10 counts too (the tailnet), and so does loopback: the
+        // client reaches a tailnet host through a local proxy on 127.0.0.1.
+        // Neither needs the 1024-byte remote cap.
+        if ((ntohl(((struct sockaddr_in*)address)->sin_addr.s_addr) & 0xFF000000) == 0x7F000000) {
+            return true;
+        }
         return isPrivateNetworkAddressV4((struct sockaddr_in*)address, true);
     }
 #ifdef AF_INET6
