@@ -5,8 +5,13 @@
 typedef struct _reed_solomon reed_solomon;
 
 // Maximum time to wait for an OOS data/FEC shard
-// after the entire FEC block should have been received
-#define RTPQ_OOS_WAIT_TIME_MS 10
+// after the entire FEC block should have been received.
+// USBridge: 10ms gave a 4x10ms block 50ms in all, and Wi-Fi hiccups of
+// 60-90ms (seen live on a phone client) delivered the audio intact but late:
+// the block had been concealed already, heard as crackling on every lag. The
+// clients' audio output buffers hold well over 100ms, so waiting longer for a
+// late shard costs no added latency in steady state.
+#define RTPQ_OOS_WAIT_TIME_MS 60
 
 #define RTPA_DATA_SHARDS 4
 #define RTPA_FEC_SHARDS 2
