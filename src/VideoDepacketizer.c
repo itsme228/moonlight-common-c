@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "FramePacer.h"
 
 // Uncomment to test 3 byte Annex B start sequences with GFE
 //#define FORCE_3_BYTE_START_SEQUENCES
@@ -48,125 +49,23 @@ static bool idrFrameProcessed;
 // for either backend and needs no protocol changes at all -- pure local
 // receive-side timing.
 //
-// Frames are released according to a fixed local schedule anchored to one
-// reference frame: schedule(frame) = anchorLocalUs + (frame.rtp - anchorRtp)
-// converted to microseconds. On a steady link this adds a constant latency
-// (the buffer depth) without changing the *gap* between releases -- the
-// constant offset cancels out between consecutive on-schedule frames -- so
-// it smooths out arrival jitter without inflating the stall metric.
+// When each frame goes is FramePacer.h's call (shared with the client's
+// display-side pacing): release at capture time + the quickest recent
+// capture-to-here time + a margin sized to the measured spread. The anchored
+// schedule this replaced (v1-v9) pushed itself later on every late frame and
+// added 3x the jitter on top, so on Wi-Fi it mostly added latency.
 //
-// If a frame's slot has already passed by the time we dequeue it, it's
-// released immediately -- but the schedule is only *re-anchored* (given up
-// on and restarted from here) when the lateness is large (> a few buffer
-// depths' worth, see PLAYOUT_RESYNC_THRESHOLD_US), meaning a real stall or
-// pause happened, not just jitter. A single late frame does NOT move the
-// anchor: the next frame is still scheduled against the same reference, so
-// the buffer's margin naturally refills as soon as arrivals catch back up.
-//
-// Design notes from earlier iterations that didn't work, kept here because
-// the failure modes are non-obvious and easy to reintroduce by accident:
-//   v1: gated the delay on "is the queue currently empty". Wrong -- an
-//       empty queue is the *normal* steady-state (the decoder consumes
-//       frames about as fast as they arrive), so that added the delay to
-//       nearly every frame's own submit gap, directly inflating the stall
-//       metric it was meant to reduce (93 vs. 79 stalls/90s on a live
-//       WiFi retest).
-//   v2: anchored schedule as described above, but re-anchored on *every*
-//       single late frame, not just large/sustained lateness. That's
-//       exactly backwards: frequent small lateness is precisely what
-//       happens when the network is jittery -- i.e. exactly when the
-//       buffer is needed -- and resyncing on every one of those misses
-//       collapses the schedule back to "release immediately" right when
-//       smoothing matters most, making it a no-op under load (measured no
-//       better than baseline, and worse in one run).
-//
-// v7: this now also applies on the CAPABILITY_DIRECT_SUBMIT path (see the
-// call site in reassembleFrame() below), not just the pull/queued decode
-// thread. Two earlier full architectures were tried and abandoned first:
-//   - Removing CAPABILITY_DIRECT_SUBMIT to activate moonlight-common-c's
-//     own queue+decoder-thread machinery (LiWaitForNextVideoFrame) worked
-//     for the buffer itself (confirmed: applied delay tracked jitter
-//     correctly, stalls dropped sharply), but running decode/render on a
-//     separate thread from the network receive thread caused a *worse*,
-//     unrelated regression on this project's macOS Metal/CVDisplayLink
-//     path: real render throughput to the screen collapsed to ~10-15fps
-//     while decode itself kept running at the full ~60fps (confirmed live:
-//     CVDisplayLink's own fire rate halved from ~60Hz to ~30Hz with the
-//     extra thread running, reproduced twice back-to-back by toggling the
-//     capability bit with nothing else changed). Not something this file
-//     can fix -- it's downstream Metal/AppKit thread-scheduling behavior.
-//
-// Applying the delay directly on the DIRECT_SUBMIT path avoids that
-// regression entirely (same one thread as before, no new thread), but
-// changes the risk profile: this thread is also the one reading the video
-// UDP socket, so sleeping here delays draining it, not just delaying
-// presentation. The video socket's receive buffer is sized generously
-// (RTP_RECV_PACKETS_BUFFERED = 2048 packets, VideoStream.c) -- around 2MB,
-// which even at a high 80 Mbps stream bitrate absorbs on the order of 200ms
-// of buffered traffic -- so a bounded sleep here has real margin before
-// risking a kernel-buffer overflow, but PLAYOUT_DELAY_MAX_US below is kept
-// well under that margin rather than pushed to it. See
-// PLAYOUT_POST_RESYNC_GRACE_US for the other DIRECT_SUBMIT-specific risk
-// (a backlog of already-arrived frames draining right after a stall) and
-// why it matters more here than on the queued path.
+// This runs on the CAPABILITY_DIRECT_SUBMIT path (see the call site in
+// reassembleFrame() below) as well as the pull/queued decode thread. On
+// DIRECT_SUBMIT this thread also reads the video UDP socket, so sleeping
+// here delays draining it: the sleep is chunked and bails as soon as a packet
+// is waiting (isVideoRtpDataPending), and the socket's receive buffer
+// (RTP_RECV_PACKETS_BUFFERED = 2048 packets, ~200ms at 80 Mbps) is well above
+// PLAYOUT_DELAY_MAX_US.
 #define PLAYOUT_JITTER_SHIFT_GROW    2      // fast growth on a real jitter spike (~1/4 weight)
 #define PLAYOUT_JITTER_SHIFT_DECAY   6      // slow decay back down (~1/64 weight) once it's calm again
-#define PLAYOUT_DELAY_MULTIPLIER     3      // target delay = jitter estimate * this
-#define PLAYOUT_DELAY_MAX_US         100000 // hard cap -- never add more than 100ms. Was 50ms, raised
-                                             // 2026-09-19: live on a genuinely bad-wifi connection,
-                                             // networkJitterUs itself (not even the x3 target) sat at
-                                             // 41000-60000us for sustained periods ("PlayoutBuffer:
-                                             // jitter=58597us target=50000us applied=50000us" in app.log)
-                                             // -- the x3-multiplier target wanted 120000-180000us and was
-                                             // being clamped to less than half that, so genuine jitter of
-                                             // that scale was passing straight through as stalls (feeding
-                                             // frame_smoothing.go's concealment) instead of being absorbed.
-                                             // 100ms matches the exact figure this file's own older comment
-                                             // already called safe for a similar design (the abandoned
-                                             // queued-decode-thread one) and stays well under the ~200ms
-                                             // the video socket's receive buffer can absorb (see above)
-                                             // even though this one runs on the same thread that drains
-                                             // that socket.
-#define PLAYOUT_RESYNC_THRESHOLD_US  200000 // give up on the schedule only past this much lateness.
-                                             // Was 150000 when PLAYOUT_DELAY_MAX_US was 50000 (100ms of
-                                             // margin above the max applied delay before giving up).
-                                             // Raising the delay cap to 100000 without raising this shrank
-                                             // that margin to 50ms, and live testing (2026-09-19, a stream
-                                             // with its own severe server-side frame-delivery shortfall --
-                                             // "Sunshine sending less than requested", 6-15fps of a 30fps
-                                             // target) hit it constantly: 39 resyncs in ~12s, alternating
-                                             // excess-lead/drift, each one a disruptive re-anchor -- visible
-                                             // as a regression ("stopped working on the other stream").
-                                             // 200000 restores the original 100ms margin above the new cap.
-#define PLAYOUT_POST_RESYNC_GRACE_US 200000 // no delay at all for this long after any resync (including
-                                             // the very first frame of a connection). A resync means we
-                                             // just fell badly behind (a real stall/pause) -- on the
-                                             // DIRECT_SUBMIT path, the frames right after very often
-                                             // arrive as a back-to-back burst already sitting in the
-                                             // socket buffer, and individually re-pacing each one back to
-                                             // nominal cadence would mean this thread -- which also reads
-                                             // that socket -- spends the whole burst duration asleep
-                                             // instead of draining it. Skipping delay for a while after
-                                             // any resync lets the burst drain immediately instead.
+#define PLAYOUT_DELAY_MAX_US         FRAME_PACER_MARGIN_MAX_US
 #define PLAYOUT_STATUS_LOG_FRAMES    120    // ~every 2s at 60fps -- tuning visibility, not spam
-#define PLAYOUT_DELAY_MAX_STEP_US    1500   // v4 bug: the raw jitter estimate can jump by tens of ms in
-                                             // one step (that's the point of its fast-growth EWMA), and
-                                             // v4 fed that directly into the per-frame schedule -- so the
-                                             // *delay itself* changing between two consecutive frames
-                                             // perturbed their release gap by that same amount, recreating
-                                             // the stall pattern the buffer exists to remove (confirmed:
-                                             // 155 stalls even after jitter calmed to 2-8ms late in a
-                                             // test run). This caps how fast the *applied* delay can move
-                                             // per frame, decoupled from how fast the estimate itself
-                                             // reacts.
-#define PLAYOUT_RAW_LEAD_ALLOWANCE_US 3000  // how far the RAW schedule (before this frame's own
-                                             // adaptive margin) may sit ahead of "now" before it's
-                                             // treated as a stale anchor artifact instead of normal
-                                             // jitter -- see the v9 fix at the "now < idealReleaseUs"
-                                             // branch below. Set well above real measured transit-time
-                                             // variance on a clean link (recvToEnqueue ~15-30us) but
-                                             // well below a single frame interval, so it never fights
-                                             // the deliberate jitter margin on a genuinely noisy link.
 #define RTP_CLOCK_RATE_HZ            90000  // fixed by the Moonlight/GameStream RTP profile
 static bool havePrevFrameTiming;
 static uint64_t prevFrameReceiveTimeUs;
@@ -202,59 +101,34 @@ static unsigned int playoutStatusLogCounter;
 // can grow it from here.
 static uint64_t selfInflictedDelayUs;
 
-static bool havePlayoutAnchor;
-static uint64_t playoutAnchorLocalUs;
-static uint32_t playoutAnchorRtpTimestamp;
-static uint64_t lastResyncLocalUs;
+static FRAME_PACER playoutPacer;
+static bool havePlayoutRtp;
+static int64_t playoutRtpTicks; // rtpTimestamp unwrapped past its 32-bit wrap
 
-// USBRIDGE_PLAYOUT_BUFFER=0 releases every frame to the decoder the moment
-// it's reassembled, like upstream moonlight-common-c (the jitter estimate
-// keeps running, so the Net Graph numbers stay live). Re-read at the start of
-// every stream (initializeVideoDepacketizer), so a client can flip it between
-// sessions -- the Windows client drives it from a video settings checkbox.
-static int playoutBufferDisabledCached = -1;
-static bool playoutBufferDisabled(void) {
-    if (playoutBufferDisabledCached < 0) {
+// USBRIDGE_PLAYOUT_BUFFER is the client's latency/smoothness slider: 0
+// releases every frame to the decoder the moment it's reassembled, like
+// upstream moonlight-common-c (the jitter estimate keeps running, so the Net
+// Graph numbers stay live); 1..FRAME_PACER_LEVELS paces (FramePacer.h).
+// Unset means level 1. Re-read at the start of every stream
+// (initializeVideoDepacketizer), so a client can change it between sessions.
+static int playoutBufferLevelCached = -1;
+static int playoutBufferLevel(void) {
+    if (playoutBufferLevelCached < 0) {
         const char* v = getenv("USBRIDGE_PLAYOUT_BUFFER");
-        playoutBufferDisabledCached = (v != NULL && strcmp(v, "0") == 0) ? 1 : 0;
+        playoutBufferLevelCached = (v != NULL) ? atoi(v) : 1;
+        if (playoutBufferLevelCached < 0) playoutBufferLevelCached = 0;
+        if (playoutBufferLevelCached > FRAME_PACER_LEVELS) playoutBufferLevelCached = FRAME_PACER_LEVELS;
+        FramePacerConfigure(&playoutPacer, playoutBufferLevelCached);
     }
-    return playoutBufferDisabledCached != 0;
+    return playoutBufferLevelCached;
+}
+static bool playoutBufferDisabled(void) {
+    return playoutBufferLevel() == 0;
 }
 
 // Converts a duration expressed in 90kHz RTP clock ticks to microseconds.
 static uint64_t rtpTicksToUs(uint32_t deltaTicks) {
     return ((uint64_t)deltaTicks * 1000ULL) / (RTP_CLOCK_RATE_HZ / 1000);
-}
-
-// Returns the raw, instantaneous playout delay target derived from the
-// current jitter estimate -- NOT what should be fed directly into the
-// per-frame schedule (see advancePlayoutDelayUs()).
-static uint64_t targetPlayoutDelayUs(void) {
-    int64_t delay = networkJitterUs * PLAYOUT_DELAY_MULTIPLIER;
-    if (delay < 0) {
-        delay = 0;
-    }
-    else if (delay > PLAYOUT_DELAY_MAX_US) {
-        delay = PLAYOUT_DELAY_MAX_US;
-    }
-    return (uint64_t)delay;
-}
-
-// Moves the actually-applied delay one step closer to targetPlayoutDelayUs(),
-// by at most PLAYOUT_DELAY_MAX_STEP_US, and returns the new applied value.
-// Must be called exactly once per frame (from playoutDelayForFrame) --
-// calling it more or less often changes the effective ramp rate.
-static uint64_t advancePlayoutDelayUs(void) {
-    uint64_t target = targetPlayoutDelayUs();
-    if (target > appliedPlayoutDelayUs) {
-        uint64_t step = target - appliedPlayoutDelayUs;
-        appliedPlayoutDelayUs += (step > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : step;
-    }
-    else if (target < appliedPlayoutDelayUs) {
-        uint64_t step = appliedPlayoutDelayUs - target;
-        appliedPlayoutDelayUs -= (step > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : step;
-    }
-    return appliedPlayoutDelayUs;
 }
 
 // Updates the jitter estimate using this newly-completed frame's RTP
@@ -270,10 +144,8 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
         // negative delta wrapped to ~4 billion ticks and briefly sent
         // networkJitterUs into the billions of "microseconds" (seen live as
         // e.g. "jitter=17123437318us" in PlayoutBuffer's own status log).
-        // Harmless today only because targetPlayoutDelayUs() hard-clamps to
-        // PLAYOUT_DELAY_MAX_US, but it made the jitter metric meaningless for
-        // diagnosing real network conditions during exactly the periods that
-        // matter most.
+        // That made the jitter metric meaningless for diagnosing real
+        // network conditions during exactly the periods that matter most.
         int32_t rtpDeltaTicks = (int32_t)(rtpTimestamp - prevFrameRtpTimestamp);
         if (rtpDeltaTicks > 0) {
             int64_t rtpDeltaUs = (int64_t)rtpTicksToUs((uint32_t)rtpDeltaTicks);
@@ -304,17 +176,8 @@ static void updatePlayoutJitterEstimate(uint64_t receiveTimeUs, uint32_t rtpTime
 
     if (++playoutStatusLogCounter >= PLAYOUT_STATUS_LOG_FRAMES) {
         playoutStatusLogCounter = 0;
-        // DEBUG: rawWantedUs is jitter*MULTIPLIER before the PLAYOUT_DELAY_MAX_US
-        // clamp -- logged unclamped so it's visible from app.log alone whether
-        // the cap is still limiting the buffer on a given connection (rawWantedUs
-        // > target means yes, by rawWantedUs-target), without having to
-        // reconstruct it from networkJitterUs by hand.
-        int64_t rawWantedUs = (int64_t)networkJitterUs * PLAYOUT_DELAY_MULTIPLIER;
-        if (rawWantedUs < 0) rawWantedUs = 0;
-        Limelog("PlayoutBuffer: jitter=%lldus rawWanted=%lldus target=%lluus applied=%lluus clamped=%s\n",
-                (long long)networkJitterUs, (long long)rawWantedUs, (unsigned long long)targetPlayoutDelayUs(),
-                (unsigned long long)LiGetPlayoutAppliedDelayUs(),
-                (rawWantedUs > (int64_t)PLAYOUT_DELAY_MAX_US) ? "YES" : "no");
+        Limelog("PlayoutBuffer: jitter=%lldus margin=%lluus\n",
+                (long long)networkJitterUs, (unsigned long long)appliedPlayoutDelayUs);
     }
 }
 
@@ -336,156 +199,27 @@ uint64_t LiGetPlayoutAppliedDelayUs(void) {
 }
 
 // Returns how long (in microseconds, possibly 0) the caller should wait
-// before releasing this already-dequeued frame to the decoder, and advances
-// the playout schedule. See the design comment above for the anchoring and
-// re-sync-on-miss behavior.
-//
-// v3 bug (found via the debug logging below): the anchor's offset from raw
-// arrival time was baked in once, from currentPlayoutDelayUs() as read at
-// the very first frame -- when the jitter estimate is still 0, since there's
-// no history yet. Because resyncs are rare by design (see above), that
-// zero offset then never got refreshed for the rest of the session: the
-// buffer was measuring jitter correctly (confirmed in the logs) but never
-// actually acting on it, a pure no-op indistinguishable from no buffer at
-// all. Fixed in v4 by keeping the anchor itself purely about raw arrival
-// timing (no offset) and adding the *current* delay on top fresh for every
-// frame, so the buffer depth actually tracks live jitter instead of a
-// stale reading from connection start.
+// before releasing this already-dequeued frame to the decoder.
 static uint64_t playoutDelayForFrame(uint64_t receiveTimeUs, uint32_t rtpTimestamp) {
-    uint64_t now = PltGetMicroseconds();
-
-    if (!havePlayoutAnchor) {
-        playoutAnchorRtpTimestamp = rtpTimestamp;
-        playoutAnchorLocalUs = receiveTimeUs;
-        havePlayoutAnchor = true;
-        lastResyncLocalUs = now;
+    if (!havePlayoutRtp) {
+        havePlayoutRtp = true;
+        playoutRtpTicks = rtpTimestamp;
     }
+    else {
+        // Signed 32-bit step: handles the 90kHz clock's ~13h wrap. A step
+        // back (seen after RFI/IDR recovery) makes the pacer start over.
+        playoutRtpTicks += (int32_t)(rtpTimestamp - (uint32_t)playoutRtpTicks);
+    }
+    int64_t ptsUs = playoutRtpTicks * 1000 / (RTP_CLOCK_RATE_HZ / 1000);
+    playoutBufferLevel(); // configures playoutPacer on the stream's first frame
+    int64_t target = FramePacerTarget(&playoutPacer, ptsUs, (int64_t)receiveTimeUs);
+    appliedPlayoutDelayUs = (uint64_t)FramePacerMarginUs(&playoutPacer);
 
-    // See PLAYOUT_POST_RESYNC_GRACE_US's doc comment above: skip delay
-    // entirely for a while after any resync, so a burst of already-arrived
-    // frames right after a stall drains immediately instead of each being
-    // individually re-paced back to nominal cadence.
-    if (now - lastResyncLocalUs < PLAYOUT_POST_RESYNC_GRACE_US) {
+    int64_t now = (int64_t)PltGetMicroseconds();
+    if (target <= now) {
         return 0;
     }
-
-    // Signed 32-bit subtraction correctly handles the RTP clock's own
-    // wraparound; a non-positive result means this frame's RTP timestamp is
-    // at or behind the anchor's -- observed after RFI/IDR recovery reorders
-    // which frame this function sees next -- so the anchor is stale. Re-anchor
-    // immediately instead of feeding it through rtpTicksToUs(): the previous
-    // unsigned cast turned a negative delta into ~4 billion ticks (~47721s)
-    // and idealReleaseUs landed that far in the future, so `now < idealReleaseUs`
-    // below was true and this returned that many *microseconds* as the delay
-    // before releasing the frame -- a real PltSleepMs() call on the thread that
-    // also drains the video socket, i.e. video freezing for hours, not the
-    // brief stall this buffer is meant to add. This can't self-heal via the
-    // lateByUs resync check further down because that check only runs when
-    // idealReleaseUs has already passed, which a schedule tens of thousands of
-    // seconds in the future never does.
-    int32_t rtpDeltaTicks = (int32_t)(rtpTimestamp - playoutAnchorRtpTimestamp);
-    if (rtpDeltaTicks < 0) {
-        playoutAnchorRtpTimestamp = rtpTimestamp;
-        playoutAnchorLocalUs = receiveTimeUs;
-        lastResyncLocalUs = now;
-        return 0;
-    }
-
-    uint64_t rawScheduleUs = playoutAnchorLocalUs + rtpTicksToUs((uint32_t)rtpDeltaTicks);
-    uint64_t idealReleaseUs = rawScheduleUs + advancePlayoutDelayUs();
-
-    if (now < idealReleaseUs) {
-        // v9 bug (found live on a real point-to-point cable link after the
-        // late-side fix above landed): the anchor's own one-time reference
-        // transit delay -- sampled from whichever single frame happened to
-        // set it (connection start, or the frame right after a resync) --
-        // can itself be anomalously large (e.g. RTSP/session-setup overhead
-        // racing the first video packet). Unlike genuine per-frame jitter,
-        // that one-off excess gets baked into rawScheduleUs for every
-        // subsequent frame with NO existing correction path: the resync/
-        // nudge logic further below only ever fires when we're running LATE
-        // against the schedule, never when we're persistently AHEAD of it.
-        // Confirmed live: jitter/applied stayed small (~1-3ms, no resyncs)
-        // yet every single frame still measured a consistent ~13-17ms
-        // mandatory sleep -- far more than the measured real transit-time
-        // variance (recvToEnqueue ~15-30us) could ever justify, i.e. this
-        // was schedule lead baked in at the anchor, not real buffering.
-        //
-        // If the RAW schedule (before this frame's own small adaptive
-        // margin) is already ahead of "now" by more than a small allowance
-        // for genuine jitter, gradually pull the anchor's local-time
-        // reference earlier so future frames' schedule catches back down to
-        // real transit time -- same bounded per-frame step as the late-side
-        // fix below, so it can't itself perturb frame-to-frame release gaps.
-        if (rawScheduleUs > now + PLAYOUT_RAW_LEAD_ALLOWANCE_US) {
-            uint64_t excessLeadUs = rawScheduleUs - now - PLAYOUT_RAW_LEAD_ALLOWANCE_US;
-
-            // Symmetric with the lateByUs resync further below: without this,
-            // a large one-off lead (startup buffering, a resolution/IDR
-            // restart, or a big jitter spike baked into the anchor) only ever
-            // drains at PLAYOUT_DELAY_MAX_STEP_US per frame -- ~90ms of
-            // correction per real second at 60fps, so a 2-3s excess lead
-            // visibly takes 20-30s to fully resolve into low latency. Snap
-            // the anchor immediately once the lead is large enough to mean a
-            // real stale reference rather than ordinary jitter, exactly like
-            // the late-side resync already does; small leads still just get
-            // the slow, non-perturbing nudge below.
-            if (excessLeadUs > PLAYOUT_RESYNC_THRESHOLD_US) {
-                Limelog("PlayoutBuffer: resync after %llums of excess lead\n", (unsigned long long)(excessLeadUs / 1000));
-                playoutAnchorRtpTimestamp = rtpTimestamp;
-                playoutAnchorLocalUs = receiveTimeUs;
-                lastResyncLocalUs = now;
-                return 0;
-            }
-
-            uint64_t nudge = (excessLeadUs > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : excessLeadUs;
-            playoutAnchorLocalUs -= nudge;
-        }
-        return idealReleaseUs - now;
-    }
-
-    // This frame's slot already passed. A small miss is normal jitter --
-    // release immediately but leave the anchor alone, so the schedule (and
-    // its buffering margin) survives for the next frame. Only give up and
-    // fully re-anchor here if the miss is large enough to mean a real stall
-    // or pause, not just jitter -- otherwise every jittery period would keep
-    // resetting the schedule right when it's needed most (see the v2 design
-    // note above).
-    uint64_t lateByUs = now - idealReleaseUs;
-    if (lateByUs > PLAYOUT_RESYNC_THRESHOLD_US) {
-        Limelog("PlayoutBuffer: resync after %llums of drift\n", (unsigned long long)(lateByUs / 1000));
-        playoutAnchorRtpTimestamp = rtpTimestamp;
-        playoutAnchorLocalUs = receiveTimeUs;
-        lastResyncLocalUs = now;
-    }
-    else if (lateByUs > 0) {
-        // v8 bug (found live on a real point-to-point cable link with
-        // near-zero actual network jitter, confirmed absent on WiFi where
-        // this buffer was originally tuned): any lateness under the resync
-        // threshold above was previously accepted and never corrected -- the
-        // anchor only moves on a >150ms drift, so a moderate offset that
-        // crept in just once (e.g. during connection startup, before
-        // anything had a chance to trigger a real resync) stayed baked into
-        // every subsequent frame's schedule for the rest of the session: a
-        // fixed, smooth-but-permanent extra delay, not jitter -- reported
-        // live as a stable ~200-300ms perceived lag that vanished entirely
-        // once this buffer was removed outright. On WiFi this was masked
-        // because real jitter crosses the 150ms resync threshold often
-        // enough on its own to keep re-correcting the schedule; a clean
-        // cable link rarely does, so a bad offset can persist indefinitely.
-        //
-        // A full resync here (like v2's mistake above) would itself perturb
-        // release timing every time normal jitter causes a small miss, so
-        // instead nudge just the anchor's local-time reference forward by a
-        // small slew-limited step -- same technique and step size already
-        // proven safe in production for appliedPlayoutDelayUs's own ramp
-        // (PLAYOUT_DELAY_MAX_STEP_US) -- so persistent lateness drains away
-        // over roughly a second instead of being locked in until a
-        // catastrophic stall happens to trigger a full resync.
-        uint64_t nudge = (lateByUs > PLAYOUT_DELAY_MAX_STEP_US) ? PLAYOUT_DELAY_MAX_STEP_US : lateByUs;
-        playoutAnchorLocalUs += nudge;
-    }
-    return 0;
+    return (uint64_t)((target - now > PLAYOUT_DELAY_MAX_US) ? PLAYOUT_DELAY_MAX_US : target - now);
 }
 
 #define DR_CLEANUP -1000
@@ -524,7 +258,7 @@ typedef struct _LENTRY_INTERNAL {
 // Init
 void initializeVideoDepacketizer(int pktSize) {
     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
-    playoutBufferDisabledCached = -1;
+    playoutBufferLevelCached = -1;
 
     nextFrameNumber = 1;
     startFrameNumber = 0;
@@ -551,10 +285,9 @@ void initializeVideoDepacketizer(int pktSize) {
     playoutStatusLogCounter = 0;
     selfInflictedDelayUs = 0;
 
-    havePlayoutAnchor = false;
-    playoutAnchorLocalUs = 0;
-    playoutAnchorRtpTimestamp = 0;
-    lastResyncLocalUs = 0;
+    FramePacerReset(&playoutPacer);
+    havePlayoutRtp = false;
+    playoutRtpTicks = 0;
 }
 
 // Free the NAL chain
@@ -1043,8 +776,8 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 // playoutDelayForFrame(). This runs on the RTP receive thread
                 // itself here (DIRECT_SUBMIT), so the sleep also delays
                 // draining the video socket, not just presentation -- see
-                // that same comment for why PLAYOUT_DELAY_MAX_US and
-                // PLAYOUT_POST_RESYNC_GRACE_US are sized the way they are.
+                // that same comment for why PLAYOUT_DELAY_MAX_US is sized
+                // the way it is.
                 uint64_t tPlayout0 = PltGetMicroseconds();
                 uint64_t delayUs = playoutDelayForFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
                 if (playoutBufferDisabled()) {
