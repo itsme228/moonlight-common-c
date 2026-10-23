@@ -90,6 +90,7 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+#define ML_FF_HAPTICS_PCM 0x04 // Client renders Vibeshine controller haptics PCM (ML_HAPTICS_PACKET_TYPE)
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 

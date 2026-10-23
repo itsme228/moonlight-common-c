@@ -1312,6 +1312,29 @@ static void controlReceiveThreadFunc(void* context) {
                 hdrEnabled = (enableByte != 0);
             }
 
+            // A pad's sound (Vibeshine haptics, USBridge speaker/headset) is a stream: handed over
+            // right here, in arrival order, to a callback that only queues it. Both payloads open
+            // with `version format controller:16 sequence:32 frames:16 reserved:16`.
+            if (IS_SUNSHINE() && (ctlHdr->type == ML_HAPTICS_PACKET_TYPE || ctlHdr->type == UB_PAD_AUDIO_PACKET_TYPE)) {
+                const uint8_t* p = (const uint8_t*)(ctlHdr + 1);
+                int length = packetLength - (int)sizeof(*ctlHdr);
+                if (length >= 12 && p[0] == 1) {
+                    uint16_t controller = (uint16_t)(p[2] | (p[3] << 8));
+                    uint32_t sequence = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+                    uint16_t frames = (uint16_t)(p[8] | (p[9] << 8));
+                    if (ctlHdr->type == ML_HAPTICS_PACKET_TYPE) {
+                        if (p[1] == 1 && controller < 16 && length == 12 + frames * 4) {
+                            ListenerCallbacks.controllerHaptics(controller, sequence, p + 12, frames);
+                        }
+                    }
+                    else if (controller < 16) {
+                        ListenerCallbacks.padAudio(controller, sequence, p[1], p + 12, (uint16_t)(length - 12), frames);
+                    }
+                }
+                free(ctlHdr);
+                continue;
+            }
+
             // Process client callbacks in a separate thread
             if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);

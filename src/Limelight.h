@@ -494,6 +494,25 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// Vibeshine's controller haptics extension (also sent by USBridge hosts): 48 kHz S16LE stereo
+// samples for a DualSense's left and right voice coil, `frames` per channel. Called on the
+// control receive thread; it must not block. Only arrives for a controller whose arrival set
+// LI_CCAP_HAPTICS_PCM.
+#define ML_HAPTICS_PACKET_TYPE 0x5601
+#define LI_CCAP_HAPTICS_PCM 0x8000
+typedef void(*ConnListenerControllerHaptics)(uint16_t controllerNumber, uint32_t sequence, const uint8_t* pcm, uint16_t frames);
+
+// USBridge extension: what the host plays into a controller's speaker or headset jack, for the
+// client to play on the real pad. `format` is UB_PAD_AUDIO_FORMAT_PCM (48 kHz S16LE stereo,
+// `frames` per channel) or UB_PAD_AUDIO_FORMAT_OPUS (one 48 kHz stereo Opus frame of `frames`).
+// Called on the control receive thread; it must not block. Only arrives for a controller whose
+// arrival set LI_CCAP_UB_PAD_AUDIO.
+#define UB_PAD_AUDIO_PACKET_TYPE 0x5542
+#define LI_CCAP_UB_PAD_AUDIO 0x4000
+#define UB_PAD_AUDIO_FORMAT_PCM 1
+#define UB_PAD_AUDIO_FORMAT_OPUS 2
+typedef void(*ConnListenerPadAudio)(uint16_t controllerNumber, uint32_t sequence, uint8_t format, const uint8_t* data, uint16_t length, uint16_t frames);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -508,6 +527,8 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerControllerHaptics controllerHaptics;
+    ConnListenerPadAudio padAudio;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
