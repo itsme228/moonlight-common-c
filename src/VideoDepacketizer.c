@@ -102,6 +102,68 @@ static unsigned int playoutStatusLogCounter;
 static uint64_t selfInflictedDelayUs;
 
 static FRAME_PACER playoutPacer;
+
+// Backlog guard. A receive thread slower than the stream (decode on it, with direct
+// submit) leaves frames waiting in the socket. With frames of a packet or two, the
+// socket's 2048 packets hold many seconds of them, nothing is lost, and the picture just
+// falls further and further behind: 11 s in a minute was measured live. So: when frames
+// come out this far later than the quickest of late, the receive loop throws away what
+// is waiting and asks for a new picture. USBRIDGE_BACKLOG_GUARD_MS=0 turns it off.
+#define BACKLOG_DEFAULT_MS 200
+#define BACKLOG_FRAMES 15
+static int64_t backlogBaseUs;
+static int backlogLateFrames;
+static bool backlogHaveBase;
+static int backlogLimitUs = -1;
+static volatile bool backlogFlushWanted;
+
+bool LiVideoTakeBacklogFlush(void) {
+    bool wanted = backlogFlushWanted;
+    backlogFlushWanted = false;
+    return wanted;
+}
+
+void LiVideoBacklogReset(void) {
+    backlogLateFrames = 0;
+}
+
+static void backlogNoteFrame(uint64_t receiveTimeUs, uint32_t rtpTimestamp) {
+    static int64_t unwrappedTicks;
+    static uint32_t lastTimestamp;
+    if (backlogLimitUs < 0) {
+        const char* v = getenv("USBRIDGE_BACKLOG_GUARD_MS");
+        backlogLimitUs = (v != NULL ? atoi(v) : BACKLOG_DEFAULT_MS) * 1000;
+    }
+    if (backlogLimitUs == 0) {
+        return;
+    }
+    if (!backlogHaveBase) {
+        unwrappedTicks = rtpTimestamp;
+    }
+    else {
+        unwrappedTicks += (int32_t)(rtpTimestamp - lastTimestamp);
+    }
+    lastTimestamp = rtpTimestamp;
+    int64_t offset = (int64_t)receiveTimeUs - unwrappedTicks * 1000 / (RTP_CLOCK_RATE_HZ / 1000);
+    if (!backlogHaveBase || offset < backlogBaseUs) {
+        backlogHaveBase = true;
+        backlogBaseUs = offset;
+    }
+    else {
+        // Follows the clocks' drift, far slower than any backlog grows.
+        int64_t rise = (offset - backlogBaseUs) >> 12;
+        backlogBaseUs += rise > 1 ? rise : 1;
+    }
+    if (offset - backlogBaseUs > backlogLimitUs) {
+        if (++backlogLateFrames >= BACKLOG_FRAMES) {
+            backlogLateFrames = 0;
+            backlogFlushWanted = true;
+        }
+    }
+    else {
+        backlogLateFrames = 0;
+    }
+}
 static bool havePlayoutRtp;
 static int64_t playoutRtpTicks; // rtpTimestamp unwrapped past its 32-bit wrap
 
@@ -287,6 +349,10 @@ void initializeVideoDepacketizer(int pktSize) {
 
     FramePacerReset(&playoutPacer);
     havePlayoutRtp = false;
+    backlogHaveBase = false;
+    backlogLateFrames = 0;
+    backlogFlushWanted = false;
+    backlogLimitUs = -1;
     playoutRtpTicks = 0;
 }
 
@@ -728,6 +794,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
 
             updatePlayoutJitterEstimate(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
+            backlogNoteFrame(qdu->decodeUnit.receiveTimeUs, qdu->decodeUnit.rtpTimestamp);
 
             // These might be wrong for a few frames during a transition between SDR and HDR,
             // but the effects shouldn't very noticable since that's an infrequent operation.

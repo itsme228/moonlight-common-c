@@ -1,5 +1,8 @@
 #include "Limelight-internal.h"
 
+bool LiVideoTakeBacklogFlush(void);
+void LiVideoBacklogReset(void);
+
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
@@ -171,6 +174,19 @@ static void VideoReceiveThreadProc(void* context) {
                 ListenerCallbacks.connectionTerminated(-1);
                 break;
             }
+        }
+
+        // See the backlog guard in VideoDepacketizer.c.
+        if (LiVideoTakeBacklogFlush()) {
+            struct pollfd pfd = { .fd = rtpSocket, .events = POLLIN };
+            int flushed = 0;
+            while (flushed < 100000 && pollSockets(&pfd, 1, 0) > 0 &&
+                   recv(rtpSocket, encrypted ? encryptedBuffer : buffer, receiveSize, 0) > 0) {
+                flushed++;
+            }
+            Limelog("Video falling behind the stream: dropped %d waiting packets\n", flushed);
+            LiVideoBacklogReset();
+            LiRequestIdrFrame();
         }
 
         err = recvUdpSocket(rtpSocket,
