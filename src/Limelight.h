@@ -755,6 +755,10 @@ int LiSendRawHidEvent(uint8_t kind, uint8_t slot, uint8_t endpoint, uint16_t tot
 #define LI_MIDI_MAX_CHUNK 128
 int LiSendMidiEvent(const uint8_t* data, uint16_t length);
 
+// Sends a phase lock report (control message 0x5530): how frames land against this
+// client's display latch, about twice a second. A host without phase lock ignores it.
+int LiSendPhaseReport(const uint8_t* data, uint16_t length);
+
 // USBridge extension: sends one Opus frame (48kHz, mono, at most
 // LI_MIC_MAX_FRAME bytes) of the client's microphone to the host, which plays
 // it into its microphone device (on a NanoKVM: the target PC's USB microphone).

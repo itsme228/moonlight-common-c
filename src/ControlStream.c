@@ -2172,3 +2172,10 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
     *metadata = hdrMetadata;
     return true;
 }
+
+int LiSendPhaseReport(const uint8_t* data, uint16_t length) {
+    if (!sendMessageAndForget(0x5530, length, data, CTRL_CHANNEL_URGENT, ENET_PACKET_FLAG_RELIABLE, false)) {
+        return -1;
+    }
+    return 0;
+}
